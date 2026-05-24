@@ -15,6 +15,7 @@ use crate::storage::manifest::{
 };
 
 use super::bucket::map_meta_err;
+use super::checksum;
 use super::state::AppState;
 
 const NULL_VERSION_ID: &str = "null";
@@ -28,7 +29,7 @@ pub async fn put_object(
 ) -> Result<Response, S3Error> {
     require_bucket(&state, bucket).await?;
 
-    // Enforce Content-MD5 if supplied (S3 returns BadDigest on mismatch).
+    // Legacy Content-MD5 verification (S3 returns BadDigest on mismatch).
     if let Some(expected) = parse_content_md5(headers)? {
         let actual = compute_md5(&body);
         if expected != actual {
@@ -38,6 +39,15 @@ pub async fn put_object(
             )
             .with_resource(format!("/{bucket}/{key}")));
         }
+    }
+
+    // Additional checksum (x-amz-checksum-*). Parsed, verified, persisted,
+    // and echoed back in the response so SDKs can confirm integrity.
+    let additional_checksum = checksum::parse_request_checksum(headers).map_err(|e| {
+        e.with_resource(format!("/{bucket}/{key}"))
+    })?;
+    if let Some(ac) = &additional_checksum {
+        checksum::verify(ac, &body).map_err(|e| e.with_resource(format!("/{bucket}/{key}")))?;
     }
 
     let part_result = state
@@ -62,7 +72,7 @@ pub async fn put_object(
         content_type: header_string(headers, &header::CONTENT_TYPE),
         user_metadata: extract_user_metadata(headers),
         tags: BTreeMap::new(),
-        additional_checksum: None,
+        additional_checksum: additional_checksum.clone(),
         storage_class: "STANDARD".into(),
         object_lock: None,
         created_at: now,
@@ -79,7 +89,15 @@ pub async fn put_object(
     gc_freed_parts(&state, &effect.freed_parts).await;
 
     let mut resp = StatusCode::OK.into_response();
-    set_header(resp.headers_mut(), "etag", &etag);
+    let resp_headers = resp.headers_mut();
+    set_header(resp_headers, "etag", &etag);
+    if let Some(ac) = &additional_checksum {
+        set_header(
+            resp_headers,
+            checksum::header_name_for(ac.algorithm),
+            &checksum::encode_value(&ac.value),
+        );
+    }
     Ok(resp)
 }
 
@@ -169,6 +187,17 @@ pub async fn get_or_head_object(
     }
     set_header(h, "accept-ranges", "bytes");
     set_header(h, "x-amz-storage-class", &manifest.storage_class);
+    // Checksums apply to the full object; do not echo them on partial-content
+    // responses (SDKs validate against received bytes and would mismatch).
+    if range.is_none()
+        && let Some(ac) = &manifest.additional_checksum
+    {
+        set_header(
+            h,
+            checksum::header_name_for(ac.algorithm),
+            &checksum::encode_value(&ac.value),
+        );
+    }
     for (k, v) in &manifest.user_metadata {
         let header_name = format!("x-amz-meta-{k}");
         set_header(h, &header_name, v);

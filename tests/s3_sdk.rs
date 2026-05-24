@@ -328,3 +328,124 @@ async fn if_none_match_star_blocks_overwrite() {
         "expected NotModified, got {msg}"
     );
 }
+
+// ---------------- Phase 4: additional checksums ----------------
+
+#[tokio::test]
+async fn put_with_sha256_checksum_stored_and_echoed() {
+    use base64::Engine as _;
+    use sha2::Digest;
+
+    let h = start_server().await;
+    let bucket = "sha256-bucket";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+
+    let payload = b"sha256 checksum body".to_vec();
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&payload);
+    let digest = hasher.finalize();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .checksum_sha256(b64.clone())
+        .body(ByteStream::from(payload.clone()))
+        .send()
+        .await
+        .expect("put_object with sha256 checksum");
+
+    let got = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("k")
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await
+        .expect("get_object with checksum mode");
+    assert_eq!(got.checksum_sha256().unwrap(), b64);
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), payload.as_slice());
+}
+
+#[tokio::test]
+async fn put_with_mismatched_sha256_returns_bad_digest() {
+    use base64::Engine as _;
+    let h = start_server().await;
+    let bucket = "bad-sha256";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+
+    let bad_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+    let err = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .checksum_sha256(bad_b64)
+        .body(ByteStream::from(b"actual body".to_vec()))
+        .send()
+        .await
+        .expect_err("mismatched sha256 should fail");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("BadDigest"), "expected BadDigest, got {msg}");
+}
+
+#[tokio::test]
+async fn put_with_crc32_checksum_succeeds() {
+    use base64::Engine as _;
+    let h = start_server().await;
+    let bucket = "crc32-bucket";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+
+    let payload = b"crc32 body content".to_vec();
+    let digest = crc32fast::hash(&payload).to_be_bytes();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .checksum_crc32(b64.clone())
+        .body(ByteStream::from(payload))
+        .send()
+        .await
+        .expect("put_object with crc32 checksum");
+
+    let got = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("k")
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.checksum_crc32().unwrap(), b64);
+}
+
+#[tokio::test]
+async fn put_with_sha1_checksum_succeeds() {
+    use base64::Engine as _;
+    use sha1::Digest;
+    let h = start_server().await;
+    let bucket = "sha1-bucket";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+
+    let payload = b"sha1 content".to_vec();
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(&payload);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .checksum_sha1(b64.clone())
+        .body(ByteStream::from(payload))
+        .send()
+        .await
+        .expect("put_object with sha1 checksum");
+}
+
