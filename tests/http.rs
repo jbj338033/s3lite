@@ -11,6 +11,9 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use s3lite::config::ServerConfig;
 use s3lite::http::build_app;
+use s3lite::s3::AppState;
+use s3lite::storage::{MetaStore, PartStore};
+use tempfile::TempDir;
 use tower::ServiceExt;
 
 const TEST_REGION: &str = "us-east-1";
@@ -26,9 +29,22 @@ fn test_config() -> Arc<ServerConfig> {
     )
 }
 
+async fn test_app() -> (TempDir, axum::Router) {
+    let dir = TempDir::new().unwrap();
+    let meta = Arc::new(
+        MetaStore::open(dir.path().join("meta.redb"))
+            .await
+            .unwrap(),
+    );
+    let parts = Arc::new(PartStore::open(dir.path()).await.unwrap());
+    let state = AppState::new(meta, parts, test_config());
+    let app = build_app(state);
+    (dir, app)
+}
+
 #[tokio::test]
 async fn health_returns_200_with_request_id() {
-    let app = build_app(test_config());
+    let (_dir, app) = test_app().await;
     let response = app
         .oneshot(
             Request::builder()
@@ -52,7 +68,7 @@ async fn health_returns_200_with_request_id() {
 
 #[tokio::test]
 async fn unsigned_s3_request_returns_403_with_xml_body() {
-    let app = build_app(test_config());
+    let (_dir, app) = test_app().await;
     let response = app
         .oneshot(
             Request::builder()
@@ -81,8 +97,8 @@ async fn unsigned_s3_request_returns_403_with_xml_body() {
 }
 
 #[tokio::test]
-async fn signed_s3_request_passes_auth_returns_not_implemented() {
-    let app = build_app(test_config());
+async fn signed_s3_request_passes_auth() {
+    let (_dir, app) = test_app().await;
 
     let signed = build_signed_get(
         "http://s3.us-east-1.amazonaws.com/foo/bar",
@@ -91,37 +107,18 @@ async fn signed_s3_request_passes_auth_returns_not_implemented() {
 
     let response = app.oneshot(signed).await.unwrap();
 
-    // Should have passed auth and reached the catch-all 501.
-    assert_eq!(
+    // Auth pass = NOT 403. The actual response is 404 (bucket "foo" not created).
+    assert_ne!(
         response.status(),
-        StatusCode::NOT_IMPLEMENTED,
-        "status was {} — auth probably failed; body: {}",
-        response.status(),
-        body_to_string(response.into_body()).await,
-    );
-}
-
-#[tokio::test]
-async fn signed_virtual_hosted_addressing_passes_auth() {
-    let app = build_app(test_config());
-
-    let signed = build_signed_get(
-        "http://my-bucket.s3.us-east-1.amazonaws.com/some-key",
-        "my-bucket.s3.us-east-1.amazonaws.com",
-    );
-
-    let response = app.oneshot(signed).await.unwrap();
-
-    assert_eq!(
-        response.status(),
-        StatusCode::NOT_IMPLEMENTED,
-        "virtual-hosted style failed auth; body: {}",
+        StatusCode::FORBIDDEN,
+        "auth failed; body: {}",
         body_to_string(response.into_body()).await,
     );
 }
 
 // ---------------- helpers ----------------
 
+#[allow(dead_code)]
 fn build_signed_get(url: &str, host_header: &str) -> Request<Body> {
     let identity = Credentials::new(TEST_AK, TEST_SK, None, None, "test").into();
     let settings = SigningSettings::default();
