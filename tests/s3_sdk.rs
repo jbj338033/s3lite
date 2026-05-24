@@ -2892,3 +2892,71 @@ async fn metrics_endpoint_skips_sigv4() {
     let resp = reqwest::get(format!("{}/metrics", h.endpoint)).await.unwrap();
     assert_eq!(resp.status(), 200);
 }
+
+// ---------------- TLS termination ----------------
+
+#[tokio::test]
+async fn https_serves_health_with_self_signed_cert() {
+    use axum_server::tls_rustls::RustlsConfig;
+
+    // rustls 0.23 needs a crypto provider; pick ring once.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Generate a self-signed cert valid for 127.0.0.1.
+    let cert_chain = rcgen::generate_simple_self_signed(vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+    ])
+    .unwrap();
+    let cert_pem = cert_chain.cert.pem();
+    let key_pem = cert_chain.key_pair.serialize_pem();
+
+    let tmp = TempDir::new().unwrap();
+    let cert_path = tmp.path().join("cert.pem");
+    let key_path = tmp.path().join("key.pem");
+    std::fs::write(&cert_path, cert_pem).unwrap();
+    std::fs::write(&key_path, key_pem).unwrap();
+
+    let data_dir = TempDir::new().unwrap();
+    let meta = Arc::new(
+        MetaStore::open(data_dir.path().join("meta.redb"))
+            .await
+            .unwrap(),
+    );
+    let parts = Arc::new(PartStore::open(data_dir.path()).await.unwrap());
+    let config = s3lite::config::ServerConfig::new(
+        REGION,
+        AK,
+        SK,
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+    );
+    let state = AppState::new(meta, parts, config);
+
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = std_listener.local_addr().unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+
+    let rustls_config = RustlsConfig::from_pem_file(&cert_path, &key_path).await.unwrap();
+    let app = build_app(state);
+    tokio::spawn(async move {
+        axum_server::from_tcp_rustls(std_listener, rustls_config)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    });
+    // Give the server a moment to start its TLS accept loop.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("https://{addr}/health"))
+        .send()
+        .await
+        .expect("HTTPS GET");
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert_eq!(body, "ok");
+}
