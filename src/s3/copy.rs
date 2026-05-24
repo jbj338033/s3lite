@@ -7,12 +7,14 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncReadExt;
 
+use crate::config::EventType;
 use crate::http::error::{S3Error, S3ErrorCode};
 use crate::storage::manifest::{
     Manifest, ManifestKey, ManifestKind, ManifestState, PartRef, VersioningState,
 };
 
 use super::bucket::map_meta_err;
+use super::events::{ObjectEvent, emit};
 use super::state::AppState;
 use super::xml::{CopyObjectResult, CopyPartResult, XmlBody};
 
@@ -129,12 +131,26 @@ pub async fn copy_object(
     };
     let etag = manifest.etag();
     let last_modified = manifest.last_modified;
+    let object_size = manifest.size;
     let effect = state
         .meta
         .put_manifest(manifest)
         .await
         .map_err(map_meta_err)?;
     gc_freed_parts(&state, &effect.freed_parts).await;
+
+    emit(
+        &state,
+        ObjectEvent {
+            event_type: EventType::ObjectCreatedCopy,
+            bucket: dest_bucket.to_string(),
+            key: dest_key.to_string(),
+            size: object_size,
+            etag: etag.clone(),
+            version_id: matches!(dest_cfg.versioning, VersioningState::Enabled)
+                .then(|| dest_version_id.clone()),
+        },
+    );
 
     let body = CopyObjectResult {
         etag,

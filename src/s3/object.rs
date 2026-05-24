@@ -16,8 +16,11 @@ use crate::storage::manifest::{
     VersioningState,
 };
 
+use crate::config::EventType;
+
 use super::bucket::map_meta_err;
 use super::checksum;
+use super::events::{ObjectEvent, emit};
 use super::lock::{default_lock_for_bucket, parse_lock_headers};
 use super::state::AppState;
 use super::tagging::parse_x_amz_tagging;
@@ -104,6 +107,7 @@ pub async fn put_object(
         upload_id: None,
     };
     let etag = manifest.etag();
+    let object_size = manifest.size;
     let effect = state
         .meta
         .put_manifest(manifest)
@@ -111,6 +115,19 @@ pub async fn put_object(
         .map_err(map_meta_err)?;
 
     gc_freed_parts(&state, &effect.freed_parts).await;
+
+    emit(
+        &state,
+        ObjectEvent {
+            event_type: EventType::ObjectCreatedPut,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            size: object_size,
+            etag: etag.clone(),
+            version_id: matches!(bucket_cfg.versioning, VersioningState::Enabled)
+                .then(|| version_id.clone()),
+        },
+    );
 
     let mut resp = StatusCode::OK.into_response();
     let resp_headers = resp.headers_mut();
@@ -296,6 +313,17 @@ pub async fn delete_object(
             {
                 Ok(effect) => {
                     gc_freed_parts(&state, &effect.freed_parts).await;
+                    emit(
+                        &state,
+                        ObjectEvent {
+                            event_type: EventType::ObjectRemovedDelete,
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                            size: 0,
+                            etag: String::new(),
+                            version_id: None,
+                        },
+                    );
                     Ok(StatusCode::NO_CONTENT.into_response())
                 }
                 Err(crate::storage::MetaError::ManifestNotFound(_)) => {
@@ -328,6 +356,18 @@ pub async fn delete_object(
             };
             let effect = state.meta.put_manifest(tombstone).await.map_err(map_meta_err)?;
             gc_freed_parts(&state, &effect.freed_parts).await;
+            emit(
+                &state,
+                ObjectEvent {
+                    event_type: EventType::ObjectRemovedDeleteMarkerCreated,
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    size: 0,
+                    etag: String::new(),
+                    version_id: matches!(bucket_cfg.versioning, VersioningState::Enabled)
+                        .then(|| tombstone_version.clone()),
+                },
+            );
             let mut resp = StatusCode::NO_CONTENT.into_response();
             set_header(resp.headers_mut(), "x-amz-delete-marker", "true");
             if matches!(bucket_cfg.versioning, VersioningState::Enabled) {

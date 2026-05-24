@@ -6,6 +6,7 @@ use bytes::Bytes;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::config::EventType;
 use crate::http::error::{S3Error, S3ErrorCode};
 use crate::storage::manifest::{
     Manifest, ManifestKey, ManifestKind, ManifestState, PartRef, UploadMode,
@@ -14,6 +15,7 @@ use crate::storage::MetaError;
 
 use super::bucket::map_meta_err;
 use super::checksum;
+use super::events::{ObjectEvent, emit};
 use super::state::AppState;
 use super::xml::{
     CompleteMultipartUploadRequest, CompleteMultipartUploadResult, InitiateMultipartUploadResult,
@@ -203,6 +205,18 @@ pub async fn complete_multipart_upload(
         .await
         .map_err(map_meta_err)?;
     gc_freed_parts(&state, &effect.freed_parts).await;
+
+    emit(
+        &state,
+        ObjectEvent {
+            event_type: EventType::ObjectCreatedCompleteMultipartUpload,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            size: total_size,
+            etag: etag.clone(),
+            version_id: None,
+        },
+    );
 
     let body = CompleteMultipartUploadResult {
         location: format!("/{bucket}/{key}"),
