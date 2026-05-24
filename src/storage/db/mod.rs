@@ -324,6 +324,28 @@ impl MetaStore {
     pub async fn list_orphan_parts(&self) -> Result<Vec<Hash>, MetaError> {
         self.dispatch(|reply| actor::Op::ListOrphanParts { reply }).await?
     }
+
+    /// Append an entry (opaque bincode-encoded blob) to the dead-letter queue,
+    /// returning the assigned sequence number.
+    pub async fn insert_dlq_entry(&self, bytes: Vec<u8>) -> Result<u64, MetaError> {
+        self.dispatch(|reply| actor::Op::InsertDlqEntry {
+            entry: actor::DlqEntryBytes(bytes),
+            reply,
+        })
+        .await?
+    }
+
+    /// Read all DLQ entries (for tests and operator inspection). Each entry
+    /// is `(sequence_number, opaque_bytes)`.
+    pub async fn list_dlq(&self) -> Result<Vec<(u64, Vec<u8>)>, MetaError> {
+        let entries = self
+            .dispatch(|reply| actor::Op::ListDlq { reply })
+            .await??;
+        Ok(entries
+            .into_iter()
+            .map(|(k, e)| (k, e.0))
+            .collect())
+    }
 }
 
 impl Drop for MetaStore {

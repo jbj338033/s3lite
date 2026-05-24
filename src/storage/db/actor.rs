@@ -129,9 +129,19 @@ pub(super) enum Op {
     ListOrphanParts {
         reply: Reply<Result<Vec<Hash>, MetaError>>,
     },
+    InsertDlqEntry {
+        entry: DlqEntryBytes,
+        reply: Reply<Result<u64, MetaError>>,
+    },
+    ListDlq {
+        reply: Reply<Result<Vec<(u64, DlqEntryBytes)>, MetaError>>,
+    },
 
     Shutdown,
 }
+
+#[derive(Debug, Clone)]
+pub(super) struct DlqEntryBytes(pub Vec<u8>);
 
 pub(super) fn run(
     path: PathBuf,
@@ -240,6 +250,12 @@ pub(super) fn run(
             }
             Op::ListOrphanParts { reply } => {
                 let _ = reply.send(handle_list_orphan_parts(&db));
+            }
+            Op::InsertDlqEntry { entry, reply } => {
+                let _ = reply.send(handle_insert_dlq(&db, &entry));
+            }
+            Op::ListDlq { reply } => {
+                let _ = reply.send(handle_list_dlq(&db));
             }
         }
     }
@@ -1026,6 +1042,39 @@ fn handle_list_orphan_parts(db: &Database) -> Result<Vec<Hash>, MetaError> {
         if e.refcount == 0 && e.state == PartState::Live {
             out.push(*k.value());
         }
+    }
+    Ok(out)
+}
+
+/// Append an opaque entry to the dead-letter queue. The key is a monotonic
+/// u64 derived from the largest existing key (+1), giving stable insertion
+/// order even across crashes.
+fn handle_insert_dlq(db: &Database, entry: &DlqEntryBytes) -> Result<u64, MetaError> {
+    let tx = db.begin_write()?;
+    let key;
+    {
+        let mut table = tx.open_table(EVENTS_DLQ)?;
+        // Pick the next id by reading the last existing one.
+        let next = table
+            .iter()?
+            .next_back()
+            .transpose()?
+            .map(|(k, _)| k.value() + 1)
+            .unwrap_or(1);
+        table.insert(next, entry.0.as_slice())?;
+        key = next;
+    }
+    tx.commit()?;
+    Ok(key)
+}
+
+fn handle_list_dlq(db: &Database) -> Result<Vec<(u64, DlqEntryBytes)>, MetaError> {
+    let tx = db.begin_read()?;
+    let table = tx.open_table(EVENTS_DLQ)?;
+    let mut out = Vec::new();
+    for entry in table.iter()? {
+        let (k, v) = entry?;
+        out.push((k.value(), DlqEntryBytes(v.value().to_vec())));
     }
     Ok(out)
 }
