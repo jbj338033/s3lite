@@ -2042,3 +2042,313 @@ async fn cors_preflight_rejected_without_matching_rule() {
     assert_eq!(resp.status(), 403);
 }
 
+// ---------------- Phase 10: object lock ----------------
+
+#[tokio::test]
+async fn create_bucket_with_object_lock_enables_versioning() {
+    let h = start_server().await;
+    let bucket = "lock-create";
+    h.client
+        .create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+
+    let cfg = h
+        .client
+        .get_object_lock_configuration()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("get_object_lock_configuration");
+    let lock_cfg = cfg.object_lock_configuration().unwrap();
+    assert_eq!(
+        lock_cfg.object_lock_enabled(),
+        Some(&aws_sdk_s3::types::ObjectLockEnabled::Enabled)
+    );
+
+    // Lock-enabled bucket auto-enables versioning
+    let v = h.client.get_bucket_versioning().bucket(bucket).send().await.unwrap();
+    assert_eq!(
+        v.status(),
+        Some(&aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+    );
+}
+
+#[tokio::test]
+async fn put_object_retention_blocks_delete_until_expiry() {
+    let h = start_server().await;
+    let bucket = "lock-ret";
+    h.client
+        .create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+
+    let r = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let vid = r.version_id().unwrap().to_string();
+
+    // Set retention 1 day in the future
+    let future = aws_sdk_s3::primitives::DateTime::from_secs(
+        (time::OffsetDateTime::now_utc() + time::Duration::days(1)).unix_timestamp(),
+    );
+    h.client
+        .put_object_retention()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&vid)
+        .retention(
+            aws_sdk_s3::types::ObjectLockRetention::builder()
+                .mode(aws_sdk_s3::types::ObjectLockRetentionMode::Compliance)
+                .retain_until_date(future)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("put_object_retention");
+
+    // Versioned DELETE on the protected version must fail
+    let err = h
+        .client
+        .delete_object()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&vid)
+        .send()
+        .await
+        .expect_err("retention should block delete");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("AccessForbidden") || msg.contains("AccessDenied") || msg.contains("403"),
+        "expected access denied, got {msg}"
+    );
+
+    // Reading retention back
+    let got = h
+        .client
+        .get_object_retention()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&vid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        got.retention().and_then(|r| r.mode()),
+        Some(&aws_sdk_s3::types::ObjectLockRetentionMode::Compliance)
+    );
+}
+
+#[tokio::test]
+async fn legal_hold_on_blocks_delete_off_allows() {
+    let h = start_server().await;
+    let bucket = "lock-lh";
+    h.client
+        .create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+
+    let r = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let vid = r.version_id().unwrap().to_string();
+
+    h.client
+        .put_object_legal_hold()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&vid)
+        .legal_hold(
+            aws_sdk_s3::types::ObjectLockLegalHold::builder()
+                .status(aws_sdk_s3::types::ObjectLockLegalHoldStatus::On)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("put_object_legal_hold ON");
+
+    let err = h
+        .client
+        .delete_object()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&vid)
+        .send()
+        .await
+        .expect_err("legal hold ON should block delete");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("AccessForbidden") || msg.contains("AccessDenied") || msg.contains("403"),
+        "expected access denied, got {msg}"
+    );
+
+    // Turn legal hold OFF
+    h.client
+        .put_object_legal_hold()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&vid)
+        .legal_hold(
+            aws_sdk_s3::types::ObjectLockLegalHold::builder()
+                .status(aws_sdk_s3::types::ObjectLockLegalHoldStatus::Off)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    h.client
+        .delete_object()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&vid)
+        .send()
+        .await
+        .expect("delete after legal hold OFF");
+}
+
+#[tokio::test]
+async fn put_object_with_per_request_lock_headers() {
+    let h = start_server().await;
+    let bucket = "lock-hdr";
+    h.client
+        .create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+
+    let future = aws_sdk_s3::primitives::DateTime::from_secs(
+        (time::OffsetDateTime::now_utc() + time::Duration::days(1)).unix_timestamp(),
+    );
+    let r = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"x".to_vec()))
+        .object_lock_mode(aws_sdk_s3::types::ObjectLockMode::Compliance)
+        .object_lock_retain_until_date(future)
+        .send()
+        .await
+        .unwrap();
+    let vid = r.version_id().unwrap().to_string();
+
+    let got = h
+        .client
+        .get_object_retention()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&vid)
+        .send()
+        .await
+        .unwrap();
+    assert!(got.retention().is_some());
+
+    // Versioned DELETE must fail due to retention applied at PUT time
+    let err = h
+        .client
+        .delete_object()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&vid)
+        .send()
+        .await
+        .expect_err("retention applied at PUT should block delete");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("AccessForbidden") || msg.contains("AccessDenied") || msg.contains("403"),
+        "expected access denied, got {msg}"
+    );
+}
+
+#[tokio::test]
+async fn compliance_retention_cannot_be_shortened() {
+    let h = start_server().await;
+    let bucket = "lock-shorten";
+    h.client
+        .create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+
+    let r = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let vid = r.version_id().unwrap().to_string();
+
+    let now = time::OffsetDateTime::now_utc();
+    let far = aws_sdk_s3::primitives::DateTime::from_secs(
+        (now + time::Duration::days(10)).unix_timestamp(),
+    );
+    let near = aws_sdk_s3::primitives::DateTime::from_secs(
+        (now + time::Duration::days(2)).unix_timestamp(),
+    );
+
+    h.client
+        .put_object_retention()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&vid)
+        .retention(
+            aws_sdk_s3::types::ObjectLockRetention::builder()
+                .mode(aws_sdk_s3::types::ObjectLockRetentionMode::Compliance)
+                .retain_until_date(far)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let err = h
+        .client
+        .put_object_retention()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&vid)
+        .retention(
+            aws_sdk_s3::types::ObjectLockRetention::builder()
+                .mode(aws_sdk_s3::types::ObjectLockRetentionMode::Compliance)
+                .retain_until_date(near)
+                .build(),
+        )
+        .send()
+        .await
+        .expect_err("shortening compliance retention should fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("AccessForbidden") || msg.contains("AccessDenied") || msg.contains("403"),
+        "expected access denied, got {msg}"
+    );
+}
+
