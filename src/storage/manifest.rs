@@ -44,11 +44,32 @@ pub enum LockMode {
     Compliance,
 }
 
+/// Retention block of an Object Lock — both fields move together: present
+/// only when the object has an active retain-until clause.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObjectLock {
+pub struct Retention {
     pub mode: LockMode,
     pub retain_until: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectLock {
+    pub retention: Option<Retention>,
     pub legal_hold: bool,
+}
+
+impl ObjectLock {
+    /// True if the lock currently forbids deletion: either retention has not
+    /// yet expired, or a legal hold is in force.
+    pub fn forbids_delete(&self, now: OffsetDateTime) -> bool {
+        if self.legal_hold {
+            return true;
+        }
+        match &self.retention {
+            Some(r) => r.retain_until > now,
+            None => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +159,24 @@ pub enum VersioningState {
     Suspended,
 }
 
+/// Bucket-level Object Lock configuration. `enabled` is set at bucket
+/// creation time (via `x-amz-bucket-object-lock-enabled: true`) and is
+/// immutable thereafter — only `default_retention` can change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectLockConfig {
+    pub enabled: bool,
+    pub default_retention: Option<DefaultRetention>,
+}
+
+/// Default retention applied to new objects when the bucket enables it.
+/// `days` and `years` are mutually exclusive in AWS — only one is set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultRetention {
+    pub mode: LockMode,
+    pub days: Option<u32>,
+    pub years: Option<u32>,
+}
+
 /// One bucket-level CORS rule. Matches AWS S3's CORSRule shape minus the
 /// rarely-used `<ID>` element (kept as Option for round-trip clients).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +196,8 @@ pub struct BucketConfig {
     pub region: String,
     #[serde(default)]
     pub cors_rules: Vec<CorsRule>,
+    #[serde(default)]
+    pub object_lock: Option<ObjectLockConfig>,
 }
 
 impl BucketConfig {
@@ -166,6 +207,7 @@ impl BucketConfig {
             versioning: VersioningState::Off,
             region: region.into(),
             cors_rules: Vec::new(),
+            object_lock: None,
         }
     }
 }
