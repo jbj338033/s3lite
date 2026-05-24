@@ -8,7 +8,7 @@ use crate::http::request_context::RequestId;
 
 use super::addressing::{Addressing, extract};
 use super::state::AppState;
-use super::{bucket, copy, cors, listing, multipart, object, tagging};
+use super::{bucket, copy, cors, listing, lock, multipart, object, tagging};
 
 /// Single entry point for every S3-shaped request. Dispatches by
 /// (method, addressing, query) to the appropriate bucket/object handler.
@@ -90,6 +90,12 @@ async fn handle(
         (Method::DELETE, Some(b), None) if has_query_flag(query, "cors") => {
             cors::delete_bucket_cors(state, &b).await
         }
+        (Method::PUT, Some(b), None) if has_query_flag(query, "object-lock") => {
+            lock::put_bucket_object_lock_config(state, &b, body.clone()).await
+        }
+        (Method::GET, Some(b), None) if has_query_flag(query, "object-lock") => {
+            lock::get_bucket_object_lock_config(state, &b).await
+        }
         (Method::OPTIONS, Some(b), _) => cors::preflight(state, &b, headers).await,
         // Bucket-level catch-alls
         (Method::PUT, Some(b), None) => bucket::create_bucket(state, &b, headers).await,
@@ -167,6 +173,22 @@ async fn handle(
         (Method::DELETE, Some(b), Some(k)) if has_query_flag(query, "tagging") => {
             let vid = query_value(query, "versionId");
             tagging::delete_object_tagging(state, &b, &k, vid.as_deref()).await
+        }
+        (Method::PUT, Some(b), Some(k)) if has_query_flag(query, "retention") => {
+            let vid = query_value(query, "versionId");
+            lock::put_object_retention(state, &b, &k, vid.as_deref(), body.clone()).await
+        }
+        (Method::GET, Some(b), Some(k)) if has_query_flag(query, "retention") => {
+            let vid = query_value(query, "versionId");
+            lock::get_object_retention(state, &b, &k, vid.as_deref()).await
+        }
+        (Method::PUT, Some(b), Some(k)) if has_query_flag(query, "legal-hold") => {
+            let vid = query_value(query, "versionId");
+            lock::put_object_legal_hold(state, &b, &k, vid.as_deref(), body.clone()).await
+        }
+        (Method::GET, Some(b), Some(k)) if has_query_flag(query, "legal-hold") => {
+            let vid = query_value(query, "versionId");
+            lock::get_object_legal_hold(state, &b, &k, vid.as_deref()).await
         }
 
         // Object-level
