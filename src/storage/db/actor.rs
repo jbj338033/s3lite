@@ -11,7 +11,10 @@ use crate::storage::manifest::{
 
 use super::errors::MetaError;
 use super::tables::{BUCKETS, EVENTS_DLQ, OBJECTS, PARTS, SERVER_META};
-use super::{ListCursor, ListItem, ListObjectsPage, ListObjectsRequest};
+use super::{
+    ListCursor, ListItem, ListObjectVersionEntry, ListObjectVersionsPage, ListObjectsPage,
+    ListObjectsRequest,
+};
 
 type Reply<T> = oneshot::Sender<T>;
 
@@ -79,6 +82,20 @@ pub(super) enum Op {
         in_progress_key: ManifestKey,
         new_committed: Manifest,
         reply: Reply<Result<DeletionEffect, MetaError>>,
+    },
+    GetLatestVersion {
+        bucket: String,
+        key: String,
+        reply: Reply<Result<Option<Manifest>, MetaError>>,
+    },
+    UpdateBucketVersioning {
+        name: String,
+        new_state: crate::storage::manifest::VersioningState,
+        reply: Reply<Result<(), MetaError>>,
+    },
+    ListObjectVersions {
+        request: ListObjectsRequest,
+        reply: Reply<Result<ListObjectVersionsPage, MetaError>>,
     },
 
     Shutdown,
@@ -157,6 +174,19 @@ pub(super) fn run(
                     &in_progress_key,
                     &new_committed,
                 ));
+            }
+            Op::GetLatestVersion { bucket, key, reply } => {
+                let _ = reply.send(handle_get_latest_version(&db, &bucket, &key));
+            }
+            Op::UpdateBucketVersioning {
+                name,
+                new_state,
+                reply,
+            } => {
+                let _ = reply.send(handle_update_bucket_versioning(&db, &name, new_state));
+            }
+            Op::ListObjectVersions { request, reply } => {
+                let _ = reply.send(handle_list_object_versions(&db, &request));
             }
         }
     }
@@ -431,6 +461,8 @@ fn handle_list_objects(
     db: &Database,
     req: &ListObjectsRequest,
 ) -> Result<ListObjectsPage, MetaError> {
+    use std::collections::BTreeMap;
+
     let tx = db.begin_read()?;
     let table = tx.open_table(OBJECTS)?;
 
@@ -445,35 +477,46 @@ fn handle_list_objects(
         v
     };
 
-    let mut items: Vec<ListItem> = Vec::new();
-    let mut truncated = false;
-    let mut next_cursor: Option<ListCursor> = None;
-    let mut skip_prefix: Option<String> = None;
-
+    // Group committed manifests by user key, then pick the latest version per
+    // key. With versioning Enabled a single key may have many manifests; with
+    // Off/Suspended there's usually one or two. BTreeMap iterates sorted by
+    // key so the downstream loop visits keys in S3's expected order.
+    let mut latest_by_key: BTreeMap<String, Manifest> = BTreeMap::new();
     for entry in table.range(scan_start.as_slice()..scan_end.as_slice())? {
         let (_k, v) = entry?;
         let manifest: Manifest = bincode_decode(v.value())?;
-
-        if !matches!(manifest.state, ManifestState::Committed)
-            || !matches!(manifest.kind, ManifestKind::Object)
-            || manifest.key.version_id != "null"
-        {
+        if !matches!(manifest.state, ManifestState::Committed) {
             continue;
         }
         if !manifest.key.key.starts_with(&req.prefix) {
             break;
         }
+        let take = match latest_by_key.get(&manifest.key.key) {
+            None => true,
+            Some(existing) => manifest.last_modified > existing.last_modified,
+        };
+        if take {
+            latest_by_key.insert(manifest.key.key.clone(), manifest);
+        }
+    }
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut truncated = false;
+    let mut next_cursor: Option<ListCursor> = None;
+    let mut skip_prefix: Option<String> = None;
+
+    for (key, manifest) in latest_by_key.iter() {
+        // Tombstones are not "current objects" — they hide the key from
+        // ListObjects. They still appear in ListObjectVersions.
+        if !matches!(manifest.kind, ManifestKind::Object) {
+            continue;
+        }
         if let Some(skip) = &skip_prefix {
-            if manifest.key.key.starts_with(skip.as_str()) {
+            if key.starts_with(skip.as_str()) {
                 continue;
             }
             skip_prefix = None;
         }
-
-        // If we've already filled `limit` items, this entry would overflow —
-        // mark truncated and emit a cursor pointing AFTER the last item we
-        // already pushed (not after this current entry, which has to be
-        // returned on the next page).
         if items.len() >= req.limit {
             truncated = true;
             next_cursor = items.last().map(|item| match item {
@@ -482,19 +525,17 @@ fn handle_list_objects(
             });
             break;
         }
-
         if let Some(delim) = &req.delimiter {
-            let after_prefix = &manifest.key.key[req.prefix.len()..];
+            let after_prefix = &key[req.prefix.len()..];
             if let Some(pos) = after_prefix.find(delim.as_str()) {
                 let common_end = req.prefix.len() + pos + delim.len();
-                let common_prefix = manifest.key.key[..common_end].to_string();
+                let common_prefix = key[..common_end].to_string();
                 items.push(ListItem::CommonPrefix(common_prefix.clone()));
                 skip_prefix = Some(common_prefix);
                 continue;
             }
         }
-
-        items.push(ListItem::Object(Box::new(manifest)));
+        items.push(ListItem::Object(Box::new(manifest.clone())));
     }
 
     Ok(ListObjectsPage {
@@ -636,6 +677,145 @@ fn handle_complete_multipart(
     }
     tx.commit()?;
     Ok(DeletionEffect { freed_parts: freed })
+}
+
+/// Return the latest committed manifest for `(bucket, key)`, of either object
+/// or tombstone kind. Latest is defined by `last_modified`. Returns `None`
+/// when no committed manifest exists for the key.
+fn handle_get_latest_version(
+    db: &Database,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<Manifest>, MetaError> {
+    let tx = db.begin_read()?;
+    let table = tx.open_table(OBJECTS)?;
+
+    let scan_start = {
+        let mut v = bucket.as_bytes().to_vec();
+        v.push(0);
+        v.extend_from_slice(key.as_bytes());
+        v.push(0);
+        v
+    };
+    let scan_end = {
+        let mut v = bucket.as_bytes().to_vec();
+        v.push(0);
+        v.extend_from_slice(key.as_bytes());
+        v.push(1);
+        v
+    };
+
+    let mut latest: Option<Manifest> = None;
+    for entry in table.range(scan_start.as_slice()..scan_end.as_slice())? {
+        let (_, v) = entry?;
+        let m: Manifest = bincode_decode(v.value())?;
+        if !matches!(m.state, ManifestState::Committed) {
+            continue;
+        }
+        if m.key.bucket != bucket || m.key.key != key {
+            continue;
+        }
+        let take = match &latest {
+            None => true,
+            Some(l) => m.last_modified > l.last_modified,
+        };
+        if take {
+            latest = Some(m);
+        }
+    }
+    Ok(latest)
+}
+
+fn handle_update_bucket_versioning(
+    db: &Database,
+    name: &str,
+    new_state: crate::storage::manifest::VersioningState,
+) -> Result<(), MetaError> {
+    let tx = db.begin_write()?;
+    {
+        let mut table = tx.open_table(BUCKETS)?;
+        let mut cfg: BucketConfig = {
+            let Some(v) = table.get(name)? else {
+                return Err(MetaError::BucketNotFound(name.to_string()));
+            };
+            bincode_decode(v.value())?
+        };
+        cfg.versioning = new_state;
+        let bytes = bincode_encode(&cfg)?;
+        table.insert(name, bytes.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Enumerate all committed manifests (object + tombstone) in the bucket,
+/// grouped by key with the latest marked `is_latest=true`. Same prefix /
+/// delimiter / pagination model as `list_objects` but at the version level.
+fn handle_list_object_versions(
+    db: &Database,
+    req: &ListObjectsRequest,
+) -> Result<ListObjectVersionsPage, MetaError> {
+    use std::collections::BTreeMap;
+
+    let tx = db.begin_read()?;
+    let table = tx.open_table(OBJECTS)?;
+
+    let scan_start = match &req.cursor {
+        None => initial_scan_start(&req.bucket, &req.prefix),
+        Some(ListCursor::AfterKey(k)) => after_key(&req.bucket, k),
+        Some(ListCursor::AfterPrefix(p)) => after_prefix(&req.bucket, p),
+    };
+    let scan_end = {
+        let mut v = req.bucket.as_bytes().to_vec();
+        v.push(1);
+        v
+    };
+
+    // Collect committed manifests grouped by key
+    let mut by_key: BTreeMap<String, Vec<Manifest>> = BTreeMap::new();
+    for entry in table.range(scan_start.as_slice()..scan_end.as_slice())? {
+        let (_, v) = entry?;
+        let m: Manifest = bincode_decode(v.value())?;
+        if !matches!(m.state, ManifestState::Committed) {
+            continue;
+        }
+        if !m.key.key.starts_with(&req.prefix) {
+            break;
+        }
+        by_key.entry(m.key.key.clone()).or_default().push(m);
+    }
+
+    let mut entries: Vec<ListObjectVersionEntry> = Vec::new();
+    let mut truncated = false;
+    let mut next_cursor: Option<ListCursor> = None;
+
+    for (_key, mut versions) in by_key {
+        // Sort by last_modified desc — newest first
+        versions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+        for (idx, m) in versions.into_iter().enumerate() {
+            let is_latest = idx == 0;
+            if entries.len() >= req.limit {
+                truncated = true;
+                next_cursor = entries
+                    .last()
+                    .map(|e| ListCursor::AfterKey(e.manifest.key.key.clone()));
+                break;
+            }
+            entries.push(ListObjectVersionEntry {
+                manifest: Box::new(m),
+                is_latest,
+            });
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    Ok(ListObjectVersionsPage {
+        entries,
+        truncated,
+        next_cursor,
+    })
 }
 
 fn handle_list_gc_pending(db: &Database) -> Result<Vec<Hash>, MetaError> {

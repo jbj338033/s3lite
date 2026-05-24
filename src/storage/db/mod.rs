@@ -44,6 +44,22 @@ pub enum ListItem {
     CommonPrefix(String),
 }
 
+/// Single entry in a `ListObjectVersionsPage`. Wraps a committed manifest
+/// (object or tombstone) with the latest-version flag.
+#[derive(Debug, Clone)]
+pub struct ListObjectVersionEntry {
+    pub manifest: Box<Manifest>,
+    pub is_latest: bool,
+}
+
+/// One page of a `ListObjectVersions` scan.
+#[derive(Debug, Clone)]
+pub struct ListObjectVersionsPage {
+    pub entries: Vec<ListObjectVersionEntry>,
+    pub truncated: bool,
+    pub next_cursor: Option<ListCursor>,
+}
+
 /// One page of a `ListObjects` scan.
 #[derive(Debug, Clone)]
 pub struct ListObjectsPage {
@@ -199,6 +215,42 @@ impl MetaStore {
             reply,
         })
         .await?
+    }
+
+    /// Return the latest committed manifest for `(bucket, key)` regardless of
+    /// kind (object or tombstone). Caller decides what to do with tombstones.
+    pub async fn get_latest_version(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Manifest>, MetaError> {
+        self.dispatch(|reply| actor::Op::GetLatestVersion {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn update_bucket_versioning(
+        &self,
+        name: &str,
+        new_state: crate::storage::manifest::VersioningState,
+    ) -> Result<(), MetaError> {
+        self.dispatch(|reply| actor::Op::UpdateBucketVersioning {
+            name: name.to_string(),
+            new_state,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn list_object_versions(
+        &self,
+        request: ListObjectsRequest,
+    ) -> Result<ListObjectVersionsPage, MetaError> {
+        self.dispatch(|reply| actor::Op::ListObjectVersions { request, reply })
+            .await?
     }
 }
 
