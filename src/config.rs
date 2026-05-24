@@ -10,6 +10,45 @@ pub struct RootKey {
     pub secret_access_key: String,
 }
 
+/// S3 event types emitted by handlers. The string form is what AWS uses in
+/// notification payloads (matches the `s3:` event filter language).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventType {
+    ObjectCreatedPut,
+    ObjectCreatedPost,
+    ObjectCreatedCopy,
+    ObjectCreatedCompleteMultipartUpload,
+    ObjectRemovedDelete,
+    ObjectRemovedDeleteMarkerCreated,
+}
+
+impl EventType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventType::ObjectCreatedPut => "s3:ObjectCreated:Put",
+            EventType::ObjectCreatedPost => "s3:ObjectCreated:Post",
+            EventType::ObjectCreatedCopy => "s3:ObjectCreated:Copy",
+            EventType::ObjectCreatedCompleteMultipartUpload => {
+                "s3:ObjectCreated:CompleteMultipartUpload"
+            }
+            EventType::ObjectRemovedDelete => "s3:ObjectRemoved:Delete",
+            EventType::ObjectRemovedDeleteMarkerCreated => "s3:ObjectRemoved:DeleteMarkerCreated",
+        }
+    }
+}
+
+/// A single webhook subscription. Matches when the bucket equals (empty bucket
+/// means any-bucket), the event type is in `events` (empty = all events), and
+/// the key passes the optional prefix/suffix filter.
+#[derive(Debug, Clone)]
+pub struct WebhookSubscription {
+    pub bucket: String,
+    pub events: Vec<EventType>,
+    pub prefix: Option<String>,
+    pub suffix: Option<String>,
+    pub url: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub region: String,
@@ -25,6 +64,13 @@ pub struct ServerConfig {
     /// limit; streaming-signed and unsigned-payload paths skip buffering
     /// (Phase 6+).
     pub max_signed_body_bytes: usize,
+    /// Outbound webhook subscriptions configured at server startup. Empty by
+    /// default; loaded from `config.toml` once Phase 14 lands.
+    pub webhook_subscriptions: Vec<WebhookSubscription>,
+    /// Default `false`: SSRF defense rejects webhook URLs that resolve to
+    /// loopback / private / link-local IPs. Tests flip this on so they can
+    /// run a local HTTP sink on 127.0.0.1.
+    pub allow_loopback_webhooks: bool,
 }
 
 impl ServerConfig {
@@ -43,6 +89,8 @@ impl ServerConfig {
             listen_addr,
             endpoint_host: None,
             max_signed_body_bytes: 64 * 1024 * 1024,
+            webhook_subscriptions: Vec::new(),
+            allow_loopback_webhooks: false,
         })
     }
 }
