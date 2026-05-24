@@ -19,6 +19,7 @@ use crate::storage::manifest::{
 use super::bucket::map_meta_err;
 use super::checksum;
 use super::state::AppState;
+use super::tagging::parse_x_amz_tagging;
 
 const NULL_VERSION_ID: &str = "null";
 
@@ -69,6 +70,8 @@ pub async fn put_object(
         .map_err(|e| S3Error::new(S3ErrorCode::InternalError, format!("part write: {e}")))?;
 
     let version_id = next_version_id(bucket_cfg.versioning);
+    let tags = parse_x_amz_tagging(headers)
+        .map_err(|e| e.with_resource(format!("/{bucket}/{key}")))?;
     let now = OffsetDateTime::now_utc();
     let manifest = Manifest {
         key: ManifestKey::new(bucket, key, &version_id),
@@ -84,7 +87,7 @@ pub async fn put_object(
         size: part_result.size,
         content_type: header_string(headers, &header::CONTENT_TYPE),
         user_metadata: extract_user_metadata(headers),
-        tags: BTreeMap::new(),
+        tags,
         additional_checksum: additional_checksum.clone(),
         storage_class: "STANDARD".into(),
         object_lock: None,

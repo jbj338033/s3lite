@@ -7,6 +7,7 @@ pub mod listing;
 pub mod multipart;
 pub mod object;
 pub mod state;
+pub mod tagging;
 pub mod xml;
 
 pub use state::AppState;

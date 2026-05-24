@@ -8,7 +8,7 @@ use crate::http::request_context::RequestId;
 
 use super::addressing::{Addressing, extract};
 use super::state::AppState;
-use super::{bucket, copy, listing, multipart, object};
+use super::{bucket, copy, listing, multipart, object, tagging};
 
 /// Single entry point for every S3-shaped request. Dispatches by
 /// (method, addressing, query) to the appropriate bucket/object handler.
@@ -143,6 +143,20 @@ async fn handle(
         }
         (Method::GET, Some(b), Some(k)) if upload_id.is_some() => {
             multipart::list_parts(state, &b, &k, upload_id.as_deref().unwrap()).await
+        }
+
+        // Object-level subresources
+        (Method::PUT, Some(b), Some(k)) if has_query_flag(query, "tagging") => {
+            let vid = query_value(query, "versionId");
+            tagging::put_object_tagging(state, &b, &k, vid.as_deref(), body.clone()).await
+        }
+        (Method::GET, Some(b), Some(k)) if has_query_flag(query, "tagging") => {
+            let vid = query_value(query, "versionId");
+            tagging::get_object_tagging(state, &b, &k, vid.as_deref()).await
+        }
+        (Method::DELETE, Some(b), Some(k)) if has_query_flag(query, "tagging") => {
+            let vid = query_value(query, "versionId");
+            tagging::delete_object_tagging(state, &b, &k, vid.as_deref()).await
         }
 
         // Object-level
