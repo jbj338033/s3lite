@@ -325,6 +325,66 @@ pub struct CorsConfiguration {
     pub rules: Vec<CorsRuleXml>,
 }
 
+// ---------------- Lifecycle ----------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename = "LifecycleConfiguration")]
+pub struct LifecycleConfigurationXml {
+    #[serde(rename = "Rule", default)]
+    pub rules: Vec<LifecycleRuleXml>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename = "Rule")]
+pub struct LifecycleRuleXml {
+    #[serde(rename = "ID", skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "Status")]
+    pub status: String,
+    #[serde(rename = "Filter", skip_serializing_if = "Option::is_none")]
+    pub filter: Option<LifecycleFilterXml>,
+    #[serde(rename = "Expiration", skip_serializing_if = "Option::is_none")]
+    pub expiration: Option<LifecycleExpirationXml>,
+    #[serde(
+        rename = "NoncurrentVersionExpiration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub noncurrent_version_expiration: Option<NoncurrentVersionExpirationXml>,
+    #[serde(
+        rename = "AbortIncompleteMultipartUpload",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub abort_incomplete_multipart_upload: Option<AbortIncompleteMultipartXml>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename = "Filter")]
+pub struct LifecycleFilterXml {
+    #[serde(rename = "Prefix", skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename = "Expiration")]
+pub struct LifecycleExpirationXml {
+    #[serde(rename = "Days")]
+    pub days: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename = "NoncurrentVersionExpiration")]
+pub struct NoncurrentVersionExpirationXml {
+    #[serde(rename = "NoncurrentDays")]
+    pub noncurrent_days: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename = "AbortIncompleteMultipartUpload")]
+pub struct AbortIncompleteMultipartXml {
+    #[serde(rename = "DaysAfterInitiation")]
+    pub days_after_initiation: u32,
+}
+
 // ---------------- Object Lock ----------------
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

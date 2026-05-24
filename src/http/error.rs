@@ -30,6 +30,7 @@ pub enum S3ErrorCode {
     NotModified,
     InvalidBucketName,
     NoSuchCorsConfiguration,
+    NoSuchLifecycleConfiguration,
     AccessForbidden,
 }
 
@@ -54,6 +55,7 @@ impl S3ErrorCode {
             PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             NotModified => StatusCode::NOT_MODIFIED,
             NoSuchCorsConfiguration => StatusCode::NOT_FOUND,
+            NoSuchLifecycleConfiguration => StatusCode::NOT_FOUND,
             AccessForbidden => StatusCode::FORBIDDEN,
         }
     }
@@ -82,6 +84,7 @@ impl S3ErrorCode {
             NotModified => "NotModified",
             InvalidBucketName => "InvalidBucketName",
             NoSuchCorsConfiguration => "NoSuchCORSConfiguration",
+            NoSuchLifecycleConfiguration => "NoSuchLifecycleConfiguration",
             AccessForbidden => "AccessForbidden",
         }
     }
