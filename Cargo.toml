@@ -21,6 +21,9 @@ uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
 
 # HTTP layer
 axum = "0.8"
