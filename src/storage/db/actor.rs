@@ -97,6 +97,16 @@ pub(super) enum Op {
         request: ListObjectsRequest,
         reply: Reply<Result<ListObjectVersionsPage, MetaError>>,
     },
+    UpdateBucketCors {
+        name: String,
+        rules: Vec<crate::storage::manifest::CorsRule>,
+        reply: Reply<Result<(), MetaError>>,
+    },
+    UpdateManifestTags {
+        key: ManifestKey,
+        tags: std::collections::BTreeMap<String, String>,
+        reply: Reply<Result<(), MetaError>>,
+    },
 
     Shutdown,
 }
@@ -187,6 +197,12 @@ pub(super) fn run(
             }
             Op::ListObjectVersions { request, reply } => {
                 let _ = reply.send(handle_list_object_versions(&db, &request));
+            }
+            Op::UpdateBucketCors { name, rules, reply } => {
+                let _ = reply.send(handle_update_bucket_cors(&db, &name, rules));
+            }
+            Op::UpdateManifestTags { key, tags, reply } => {
+                let _ = reply.send(handle_update_manifest_tags(&db, &key, tags));
             }
         }
     }
@@ -816,6 +832,53 @@ fn handle_list_object_versions(
         truncated,
         next_cursor,
     })
+}
+
+fn handle_update_bucket_cors(
+    db: &Database,
+    name: &str,
+    rules: Vec<crate::storage::manifest::CorsRule>,
+) -> Result<(), MetaError> {
+    let tx = db.begin_write()?;
+    {
+        let mut table = tx.open_table(BUCKETS)?;
+        let mut cfg: BucketConfig = {
+            let Some(v) = table.get(name)? else {
+                return Err(MetaError::BucketNotFound(name.to_string()));
+            };
+            bincode_decode(v.value())?
+        };
+        cfg.cors_rules = rules;
+        let bytes = bincode_encode(&cfg)?;
+        table.insert(name, bytes.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Replace just the tag set on a manifest. Per S3 semantics, tag updates
+/// do NOT touch `last_modified` or `etag`.
+fn handle_update_manifest_tags(
+    db: &Database,
+    key: &ManifestKey,
+    tags: std::collections::BTreeMap<String, String>,
+) -> Result<(), MetaError> {
+    let tx = db.begin_write()?;
+    {
+        let mut objects = tx.open_table(OBJECTS)?;
+        let key_bytes = key.encode();
+        let mut m: Manifest = {
+            let Some(v) = objects.get(key_bytes.as_slice())? else {
+                return Err(MetaError::ManifestNotFound(key.clone()));
+            };
+            bincode_decode(v.value())?
+        };
+        m.tags = tags;
+        let bytes = bincode_encode(&m)?;
+        objects.insert(key_bytes.as_slice(), bytes.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn handle_list_gc_pending(db: &Database) -> Result<Vec<Hash>, MetaError> {

@@ -138,11 +138,25 @@ pub enum VersioningState {
     Suspended,
 }
 
+/// One bucket-level CORS rule. Matches AWS S3's CORSRule shape minus the
+/// rarely-used `<ID>` element (kept as Option for round-trip clients).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorsRule {
+    pub id: Option<String>,
+    pub allowed_origins: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub allowed_headers: Vec<String>,
+    pub expose_headers: Vec<String>,
+    pub max_age_seconds: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketConfig {
     pub created_at: OffsetDateTime,
     pub versioning: VersioningState,
     pub region: String,
+    #[serde(default)]
+    pub cors_rules: Vec<CorsRule>,
 }
 
 impl BucketConfig {
@@ -151,6 +165,7 @@ impl BucketConfig {
             created_at: OffsetDateTime::now_utc(),
             versioning: VersioningState::Off,
             region: region.into(),
+            cors_rules: Vec::new(),
         }
     }
 }

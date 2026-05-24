@@ -252,6 +252,28 @@ impl MetaStore {
         self.dispatch(|reply| actor::Op::ListObjectVersions { request, reply })
             .await?
     }
+
+    pub async fn update_bucket_cors(
+        &self,
+        name: &str,
+        rules: Vec<crate::storage::manifest::CorsRule>,
+    ) -> Result<(), MetaError> {
+        self.dispatch(|reply| actor::Op::UpdateBucketCors {
+            name: name.to_string(),
+            rules,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn update_manifest_tags(
+        &self,
+        key: ManifestKey,
+        tags: std::collections::BTreeMap<String, String>,
+    ) -> Result<(), MetaError> {
+        self.dispatch(|reply| actor::Op::UpdateManifestTags { key, tags, reply })
+            .await?
+    }
 }
 
 impl Drop for MetaStore {
