@@ -8,7 +8,7 @@ use crate::http::request_context::RequestId;
 
 use super::addressing::{Addressing, extract};
 use super::state::AppState;
-use super::{bucket, copy, listing, multipart, object, tagging};
+use super::{bucket, copy, cors, listing, multipart, object, tagging};
 
 /// Single entry point for every S3-shaped request. Dispatches by
 /// (method, addressing, query) to the appropriate bucket/object handler.
@@ -81,6 +81,16 @@ async fn handle(
         (Method::GET, Some(b), None) if has_query_flag(query, "versions") => {
             listing::list_object_versions(state, &b, query).await
         }
+        (Method::PUT, Some(b), None) if has_query_flag(query, "cors") => {
+            cors::put_bucket_cors(state, &b, body.clone()).await
+        }
+        (Method::GET, Some(b), None) if has_query_flag(query, "cors") => {
+            cors::get_bucket_cors(state, &b).await
+        }
+        (Method::DELETE, Some(b), None) if has_query_flag(query, "cors") => {
+            cors::delete_bucket_cors(state, &b).await
+        }
+        (Method::OPTIONS, Some(b), _) => cors::preflight(state, &b, headers).await,
         // Bucket-level catch-alls
         (Method::PUT, Some(b), None) => bucket::create_bucket(state, &b).await,
         (Method::DELETE, Some(b), None) => bucket::delete_bucket(state, &b).await,
