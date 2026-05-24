@@ -77,6 +77,10 @@ pub struct ListObjectsPage {
 /// directly — the data plane invariant is enforced by visibility.
 pub struct MetaStore {
     sender: mpsc::Sender<actor::Op>,
+    /// Handle to the redb actor thread. Dropped explicitly on `MetaStore::drop`
+    /// so the exclusive redb file lock is released synchronously — admin
+    /// tools like backup can immediately re-open the same file.
+    actor_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MetaStore {
@@ -85,13 +89,16 @@ impl MetaStore {
         let (sender, receiver) = mpsc::channel::<actor::Op>(256);
         let (ready_tx, ready_rx) = oneshot::channel();
 
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("s3lite-redb".into())
             .spawn(move || actor::run(path, receiver, ready_tx))
             .map_err(|e| MetaError::ActorSpawn(e.to_string()))?;
 
         match ready_rx.await {
-            Ok(Ok(())) => Ok(Self { sender }),
+            Ok(Ok(())) => Ok(Self {
+                sender,
+                actor_thread: Some(handle),
+            }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(MetaError::ActorDied),
         }
@@ -350,7 +357,12 @@ impl MetaStore {
 
 impl Drop for MetaStore {
     fn drop(&mut self) {
-        // Best-effort: actor exits when the channel closes anyway.
+        // Signal then join — without joining, the redb exclusive lock can
+        // outlive `MetaStore` and block subsequent opens (notably the admin
+        // backup path that opens the same data dir).
         let _ = self.sender.try_send(actor::Op::Shutdown);
+        if let Some(handle) = self.actor_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
