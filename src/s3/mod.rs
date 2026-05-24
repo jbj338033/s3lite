@@ -1,6 +1,7 @@
 pub mod addressing;
 pub mod bucket;
 pub mod checksum;
+pub mod copy;
 pub mod dispatch;
 pub mod listing;
 pub mod multipart;

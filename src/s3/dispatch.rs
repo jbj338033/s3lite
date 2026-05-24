@@ -8,7 +8,7 @@ use crate::http::request_context::RequestId;
 
 use super::addressing::{Addressing, extract};
 use super::state::AppState;
-use super::{bucket, listing, multipart, object};
+use super::{bucket, copy, listing, multipart, object};
 
 /// Single entry point for every S3-shaped request. Dispatches by
 /// (method, addressing, query) to the appropriate bucket/object handler.
@@ -102,6 +102,26 @@ async fn handle(
             .await
         }
         (Method::PUT, Some(b), Some(k))
+            if upload_id.is_some()
+                && part_number.is_some()
+                && headers.get("x-amz-copy-source").is_some() =>
+        {
+            let pn: u32 = part_number.as_deref().unwrap().parse().map_err(|_| {
+                S3Error::new(S3ErrorCode::InvalidArgument, "partNumber must be a number")
+            })?;
+            let source = parse_copy_source_header(headers)?;
+            copy::upload_part_copy(
+                state,
+                &b,
+                &k,
+                upload_id.as_deref().unwrap(),
+                pn,
+                source,
+                headers,
+            )
+            .await
+        }
+        (Method::PUT, Some(b), Some(k))
             if upload_id.is_some() && part_number.is_some() =>
         {
             let pn: u32 = part_number.as_deref().unwrap().parse().map_err(|_| {
@@ -126,6 +146,10 @@ async fn handle(
         }
 
         // Object-level
+        (Method::PUT, Some(b), Some(k)) if headers.get("x-amz-copy-source").is_some() => {
+            let source = parse_copy_source_header(headers)?;
+            copy::copy_object(state, &b, &k, source, headers).await
+        }
         (Method::PUT, Some(b), Some(k)) => object::put_object(state, &b, &k, headers, body).await,
         (Method::GET, Some(b), Some(k)) => {
             let vid = query_value(query, "versionId");
@@ -149,6 +173,16 @@ async fn handle(
         )
         .with_resource(String::new())),
     }
+}
+
+fn parse_copy_source_header(headers: &axum::http::HeaderMap) -> Result<copy::CopySource, S3Error> {
+    let raw = headers
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            S3Error::new(S3ErrorCode::InvalidArgument, "missing x-amz-copy-source header")
+        })?;
+    copy::parse_copy_source(raw)
 }
 
 fn query_value(query: &str, key: &str) -> Option<String> {
