@@ -2,5 +2,25 @@
 name = "s3lite"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
+tokio = { version = "1", features = ["full"] }
+redb = "2"
+blake3 = "1"
+md-5 = "0.10"
+time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+hex = "0.4"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
