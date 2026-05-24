@@ -131,20 +131,19 @@ pub async fn get_or_head_object(
     let body_bytes = if body_only_headers {
         Bytes::new()
     } else {
-        // Phase 3: single-part objects only. Open the lone part and slice if range.
-        let part_ref = manifest
-            .parts
-            .first()
-            .ok_or_else(|| S3Error::new(S3ErrorCode::InternalError, "empty manifest"))?;
-        let mut file = state
-            .parts
-            .open_read(&part_ref.hash)
-            .await
-            .map_err(|e| S3Error::new(S3ErrorCode::InternalError, format!("part open: {e}")))?;
-        let mut buf = Vec::with_capacity(part_ref.size as usize);
-        file.read_to_end(&mut buf)
-            .await
-            .map_err(|e| S3Error::new(S3ErrorCode::InternalError, format!("part read: {e}")))?;
+        // Multipart objects: concatenate parts in part_number order. For
+        // small/medium objects (Phase 6's scope), buffer everything then
+        // slice. Streaming-multipart-GET that reads one part at a time
+        // belongs in a later optimization pass.
+        let mut buf = Vec::with_capacity(manifest.size as usize);
+        for part_ref in &manifest.parts {
+            let mut file = state.parts.open_read(&part_ref.hash).await.map_err(|e| {
+                S3Error::new(S3ErrorCode::InternalError, format!("part open: {e}"))
+            })?;
+            file.read_to_end(&mut buf).await.map_err(|e| {
+                S3Error::new(S3ErrorCode::InternalError, format!("part read: {e}"))
+            })?;
+        }
         match &range {
             Some((start, end)) => Bytes::copy_from_slice(&buf[*start as usize..=*end as usize]),
             None => Bytes::from(buf),
