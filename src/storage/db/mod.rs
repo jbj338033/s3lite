@@ -296,6 +296,34 @@ impl MetaStore {
         self.dispatch(|reply| actor::Op::UpdateManifestLock { key, lock, reply })
             .await?
     }
+
+    pub async fn update_bucket_lifecycle(
+        &self,
+        name: &str,
+        rules: Vec<crate::storage::manifest::LifecycleRule>,
+    ) -> Result<(), MetaError> {
+        self.dispatch(|reply| actor::Op::UpdateBucketLifecycle {
+            name: name.to_string(),
+            rules,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn list_all_manifests_in_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<Manifest>, MetaError> {
+        self.dispatch(|reply| actor::Op::ListAllManifestsInBucket {
+            bucket: bucket.to_string(),
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn list_orphan_parts(&self) -> Result<Vec<Hash>, MetaError> {
+        self.dispatch(|reply| actor::Op::ListOrphanParts { reply }).await?
+    }
 }
 
 impl Drop for MetaStore {

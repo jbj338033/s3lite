@@ -117,6 +117,18 @@ pub(super) enum Op {
         lock: Option<crate::storage::manifest::ObjectLock>,
         reply: Reply<Result<(), MetaError>>,
     },
+    UpdateBucketLifecycle {
+        name: String,
+        rules: Vec<crate::storage::manifest::LifecycleRule>,
+        reply: Reply<Result<(), MetaError>>,
+    },
+    ListAllManifestsInBucket {
+        bucket: String,
+        reply: Reply<Result<Vec<Manifest>, MetaError>>,
+    },
+    ListOrphanParts {
+        reply: Reply<Result<Vec<Hash>, MetaError>>,
+    },
 
     Shutdown,
 }
@@ -219,6 +231,15 @@ pub(super) fn run(
             }
             Op::UpdateManifestLock { key, lock, reply } => {
                 let _ = reply.send(handle_update_manifest_lock(&db, &key, lock));
+            }
+            Op::UpdateBucketLifecycle { name, rules, reply } => {
+                let _ = reply.send(handle_update_bucket_lifecycle(&db, &name, rules));
+            }
+            Op::ListAllManifestsInBucket { bucket, reply } => {
+                let _ = reply.send(handle_list_all_manifests_in_bucket(&db, &bucket));
+            }
+            Op::ListOrphanParts { reply } => {
+                let _ = reply.send(handle_list_orphan_parts(&db));
             }
         }
     }
@@ -942,6 +963,71 @@ fn handle_update_manifest_lock(
     }
     tx.commit()?;
     Ok(())
+}
+
+fn handle_update_bucket_lifecycle(
+    db: &Database,
+    name: &str,
+    rules: Vec<crate::storage::manifest::LifecycleRule>,
+) -> Result<(), MetaError> {
+    let tx = db.begin_write()?;
+    {
+        let mut table = tx.open_table(BUCKETS)?;
+        let mut cfg: BucketConfig = {
+            let Some(v) = table.get(name)? else {
+                return Err(MetaError::BucketNotFound(name.to_string()));
+            };
+            bincode_decode(v.value())?
+        };
+        cfg.lifecycle_rules = rules;
+        let bytes = bincode_encode(&cfg)?;
+        table.insert(name, bytes.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Maintenance helper — return every manifest in the bucket regardless of
+/// state/kind. Used by the lifecycle sweeper to evaluate Expiration on
+/// committed objects, NoncurrentVersionExpiration on older versions, and
+/// AbortIncompleteMultipart on in-progress uploads.
+fn handle_list_all_manifests_in_bucket(
+    db: &Database,
+    bucket: &str,
+) -> Result<Vec<Manifest>, MetaError> {
+    let tx = db.begin_read()?;
+    let table = tx.open_table(OBJECTS)?;
+    let mut start = bucket.as_bytes().to_vec();
+    start.push(0);
+    let mut end = bucket.as_bytes().to_vec();
+    end.push(1);
+    let mut out = Vec::new();
+    for entry in table.range(start.as_slice()..end.as_slice())? {
+        let (_, v) = entry?;
+        let m: Manifest = bincode_decode(v.value())?;
+        if m.key.bucket != bucket {
+            continue;
+        }
+        out.push(m);
+    }
+    Ok(out)
+}
+
+/// Maintenance helper — list part hashes that have refcount=0 and are still
+/// in the Live state (not yet handed off to the GC pipeline). These are the
+/// orphans that the inline GC path failed to reach (e.g., after a crash).
+fn handle_list_orphan_parts(db: &Database) -> Result<Vec<Hash>, MetaError> {
+    let tx = db.begin_read()?;
+    let parts = tx.open_table(PARTS)?;
+    let mut out = Vec::new();
+    for entry in parts.iter()? {
+        let (k, v) = entry?;
+        let e: PartEntry = bincode_decode(v.value())?;
+        if e.refcount == 0 && e.state == PartState::Live {
+            out.push(*k.value());
+        }
+    }
+    Ok(out)
 }
 
 fn handle_list_gc_pending(db: &Database) -> Result<Vec<Hash>, MetaError> {
