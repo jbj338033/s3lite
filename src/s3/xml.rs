@@ -69,3 +69,82 @@ pub struct LocationConstraint {
     #[serde(rename = "$text")]
     pub region: String,
 }
+
+// ---------------- ListObjects (V1 + V2) ----------------
+
+#[derive(Debug, Serialize)]
+pub struct ObjectContent {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "Size")]
+    pub size: u64,
+    #[serde(rename = "StorageClass")]
+    pub storage_class: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommonPrefix {
+    #[serde(rename = "Prefix")]
+    pub prefix: String,
+}
+
+/// Response body for `ListObjectsV2`. Optional fields are omitted from XML
+/// when `None` so the wire output matches AWS exactly.
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListBucketResult")]
+pub struct ListBucketResultV2 {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Prefix")]
+    pub prefix: String,
+    #[serde(rename = "KeyCount")]
+    pub key_count: u32,
+    #[serde(rename = "MaxKeys")]
+    pub max_keys: u32,
+    #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(rename = "IsTruncated")]
+    pub is_truncated: bool,
+    #[serde(rename = "EncodingType", skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
+    #[serde(rename = "ContinuationToken", skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
+    #[serde(rename = "NextContinuationToken", skip_serializing_if = "Option::is_none")]
+    pub next_continuation_token: Option<String>,
+    #[serde(rename = "StartAfter", skip_serializing_if = "Option::is_none")]
+    pub start_after: Option<String>,
+    #[serde(rename = "Contents", default)]
+    pub contents: Vec<ObjectContent>,
+    #[serde(rename = "CommonPrefixes", default)]
+    pub common_prefixes: Vec<CommonPrefix>,
+}
+
+/// Response body for `ListObjects` (V1).
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListBucketResult")]
+pub struct ListBucketResultV1 {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Prefix")]
+    pub prefix: String,
+    #[serde(rename = "Marker")]
+    pub marker: String,
+    #[serde(rename = "MaxKeys")]
+    pub max_keys: u32,
+    #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(rename = "IsTruncated")]
+    pub is_truncated: bool,
+    #[serde(rename = "EncodingType", skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
+    #[serde(rename = "NextMarker", skip_serializing_if = "Option::is_none")]
+    pub next_marker: Option<String>,
+    #[serde(rename = "Contents", default)]
+    pub contents: Vec<ObjectContent>,
+    #[serde(rename = "CommonPrefixes", default)]
+    pub common_prefixes: Vec<CommonPrefix>,
+}
