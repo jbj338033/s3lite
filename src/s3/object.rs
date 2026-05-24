@@ -18,6 +18,7 @@ use crate::storage::manifest::{
 
 use super::bucket::map_meta_err;
 use super::checksum;
+use super::lock::{default_lock_for_bucket, parse_lock_headers};
 use super::state::AppState;
 use super::tagging::parse_x_amz_tagging;
 
@@ -72,6 +73,13 @@ pub async fn put_object(
     let version_id = next_version_id(bucket_cfg.versioning);
     let tags = parse_x_amz_tagging(headers)
         .map_err(|e| e.with_resource(format!("/{bucket}/{key}")))?;
+    // Per-object lock headers override the bucket default retention.
+    let object_lock = match parse_lock_headers(headers)
+        .map_err(|e| e.with_resource(format!("/{bucket}/{key}")))?
+    {
+        Some(l) => Some(l),
+        None => default_lock_for_bucket(&bucket_cfg.object_lock),
+    };
     let now = OffsetDateTime::now_utc();
     let manifest = Manifest {
         key: ManifestKey::new(bucket, key, &version_id),
@@ -90,7 +98,7 @@ pub async fn put_object(
         tags,
         additional_checksum: additional_checksum.clone(),
         storage_class: "STANDARD".into(),
-        object_lock: None,
+        object_lock,
         created_at: now,
         last_modified: now,
         upload_id: None,
@@ -259,6 +267,26 @@ pub async fn delete_object(
         return delete_specific_version(&state, bucket, key, vid).await;
     }
 
+    // For unversioned DELETE, the current version's lock blocks tombstoning.
+    // (Enabled mode without lock still creates a tombstone — the underlying
+    // object stays put, so no lock violation. But Off mode does a permanent
+    // delete and must respect the lock.)
+    if matches!(bucket_cfg.versioning, VersioningState::Off)
+        && let Some(current) = state
+            .meta
+            .get_manifest(ManifestKey::new(bucket, key, NULL_VERSION_ID))
+            .await
+            .map_err(map_meta_err)?
+        && let Some(lock) = &current.object_lock
+        && lock.forbids_delete(OffsetDateTime::now_utc())
+    {
+        return Err(S3Error::new(
+            S3ErrorCode::AccessForbidden,
+            "object is locked by retention or legal hold",
+        )
+        .with_resource(format!("/{bucket}/{key}")));
+    }
+
     match bucket_cfg.versioning {
         VersioningState::Off => {
             match state
@@ -322,6 +350,18 @@ async fn delete_specific_version(
         maybe.as_ref().map(|m| m.kind),
         Some(ManifestKind::Tombstone)
     );
+    // Object Lock enforcement: Compliance mode cannot be bypassed. Tombstone
+    // manifests don't carry locks; only object-kind versions do.
+    if let Some(m) = &maybe
+        && let Some(lock) = &m.object_lock
+        && lock.forbids_delete(OffsetDateTime::now_utc())
+    {
+        return Err(S3Error::new(
+            S3ErrorCode::AccessForbidden,
+            "object is locked by retention or legal hold",
+        )
+        .with_resource(format!("/{bucket}/{key}")));
+    }
     match state.meta.delete_manifest(target).await {
         Ok(effect) => {
             gc_freed_parts(state, &effect.freed_parts).await;
