@@ -20,6 +20,7 @@ use tower::{BoxError, Service};
 
 use crate::config::ServerConfig;
 use crate::http::error::{S3Error, S3ErrorCode};
+use crate::http::middleware::presigned;
 use crate::http::request_context::{AuthenticatedIdentity, RequestId};
 
 const S3_SERVICE: &str = "s3";
@@ -75,7 +76,7 @@ impl Service<GetSigningKeyRequest> for RootKeyService {
 /// in Phase 6+.
 pub async fn sigv4_mw(
     State(config): State<Arc<ServerConfig>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, S3Error> {
     // CORS preflight requests carry no Sigv4 signature by design — let them
@@ -87,6 +88,28 @@ pub async fn sigv4_mw(
 
     let request_id_ext = req.extensions().get::<RequestId>().cloned();
     let resource_path = req.uri().path().to_string();
+
+    // Presigned URLs need their own verifier — scratchstack 0.11.4 does not
+    // URL-decode the `/` separators in `X-Amz-Credential`, so we handle
+    // query-signed requests inline.
+    if presigned::is_presigned(req.uri()) {
+        let decorate = |e: S3Error| {
+            let mut e = e.with_resource(resource_path.clone());
+            if let Some(id) = &request_id_ext {
+                e = e.with_request_id(id.clone());
+            }
+            e
+        };
+        match presigned::verify(req.method(), req.uri(), req.headers(), &config) {
+            Ok(()) => {
+                req.extensions_mut().insert(AuthenticatedIdentity {
+                    access_key_id: config.root_key.access_key_id.clone(),
+                });
+                return Ok(next.run(req).await);
+            }
+            Err(e) => return Err(decorate(e)),
+        }
+    }
     let decorate = |mut e: S3Error| {
         e = e.with_resource(resource_path.clone());
         if let Some(id) = &request_id_ext {
@@ -128,11 +151,9 @@ pub async fn sigv4_mw(
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(error = %e, "sigv4 verification failed");
-            // TODO Phase 6+: downcast SignatureError variants to richer mapping
-            // (RequestTimeTooSkewed, MissingSecurityHeader, etc.).
             return Err(attach_id(S3Error::new(
                 S3ErrorCode::SignatureDoesNotMatch,
-                "signature verification failed",
+                format!("signature verification failed: {e}"),
             )));
         }
     };
