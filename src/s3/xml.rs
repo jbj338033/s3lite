@@ -325,6 +325,51 @@ pub struct CorsConfiguration {
     pub rules: Vec<CorsRuleXml>,
 }
 
+// ---------------- Object Lock ----------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename = "ObjectLockConfiguration")]
+pub struct ObjectLockConfigurationXml {
+    #[serde(rename = "ObjectLockEnabled", skip_serializing_if = "Option::is_none")]
+    pub object_lock_enabled: Option<String>,
+    #[serde(rename = "Rule", skip_serializing_if = "Option::is_none")]
+    pub rule: Option<ObjectLockRuleXml>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename = "Rule")]
+pub struct ObjectLockRuleXml {
+    #[serde(rename = "DefaultRetention", skip_serializing_if = "Option::is_none")]
+    pub default_retention: Option<DefaultRetentionXml>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename = "DefaultRetention")]
+pub struct DefaultRetentionXml {
+    #[serde(rename = "Mode", skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(rename = "Days", skip_serializing_if = "Option::is_none")]
+    pub days: Option<u32>,
+    #[serde(rename = "Years", skip_serializing_if = "Option::is_none")]
+    pub years: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename = "Retention")]
+pub struct RetentionXml {
+    #[serde(rename = "Mode")]
+    pub mode: String,
+    #[serde(rename = "RetainUntilDate")]
+    pub retain_until_date: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename = "LegalHold")]
+pub struct LegalHoldXml {
+    #[serde(rename = "Status")]
+    pub status: String,
+}
+
 // ---------------- Copy ----------------
 
 /// Response body for `CopyObject`.
