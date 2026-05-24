@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use blake3::Hasher as Blake3Hasher;
+use bytes::Bytes;
 use md5::{Digest, Md5};
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -109,6 +110,13 @@ impl PartStore {
             md5: md5_digest,
             size,
         })
+    }
+
+    /// Convenience variant for already-buffered payloads (sigv4 middleware
+    /// has buffered the request body to `Bytes`). Same tmp→rename semantics
+    /// and dedup behavior as `write_stream`.
+    pub async fn write_bytes(&self, data: Bytes) -> Result<PartWriteResult, PartError> {
+        self.write_stream(&data[..]).await
     }
 
     pub async fn open_read(&self, hash: &Hash) -> Result<fs::File, PartError> {
