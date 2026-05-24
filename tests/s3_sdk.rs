@@ -2858,3 +2858,37 @@ async fn presigned_url_expires() {
         "expired presigned URL should be rejected"
     );
 }
+
+// ---------------- Phase 14: /metrics ----------------
+
+#[tokio::test]
+async fn metrics_endpoint_exposes_prometheus_text() {
+    let h = start_server().await;
+    h.client.create_bucket().bucket("metrics-a").send().await.unwrap();
+    h.client.create_bucket().bucket("metrics-b").send().await.unwrap();
+
+    let resp = reqwest::get(format!("{}/metrics", h.endpoint))
+        .await
+        .expect("GET /metrics");
+    assert!(resp.status().is_success(), "/metrics returned {}", resp.status());
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(ct.starts_with("text/plain"), "content-type was {ct}");
+
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("s3lite_buckets_total 2"), "body: {body}");
+    assert!(body.contains("s3lite_dlq_entries_total 0"), "body: {body}");
+    assert!(body.contains("s3lite_build_info"), "body: {body}");
+}
+
+#[tokio::test]
+async fn metrics_endpoint_skips_sigv4() {
+    let h = start_server().await;
+    // No Authorization header, no presigned signature — /metrics must be public.
+    let resp = reqwest::get(format!("{}/metrics", h.endpoint)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
