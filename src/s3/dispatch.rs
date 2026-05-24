@@ -68,13 +68,20 @@ async fn handle(
     match (method, addressing.bucket, addressing.key) {
         (Method::GET, None, _) => bucket::list_buckets(state).await,
 
-        // Bucket-level
-        (Method::PUT, Some(b), None) => bucket::create_bucket(state, &b).await,
-        (Method::DELETE, Some(b), None) => bucket::delete_bucket(state, &b).await,
-        (Method::HEAD, Some(b), None) => bucket::head_bucket(state, &b).await,
+        // Bucket-level subresources (must precede the catch-all bucket arms)
+        (Method::PUT, Some(b), None) if has_query_flag(query, "versioning") => {
+            bucket::put_bucket_versioning(state, &b, body.clone()).await
+        }
+        (Method::GET, Some(b), None) if has_query_flag(query, "versioning") => {
+            bucket::get_bucket_versioning(state, &b).await
+        }
         (Method::GET, Some(b), None) if has_query_flag(query, "location") => {
             bucket::get_bucket_location(state, &b).await
         }
+        // Bucket-level catch-alls
+        (Method::PUT, Some(b), None) => bucket::create_bucket(state, &b).await,
+        (Method::DELETE, Some(b), None) => bucket::delete_bucket(state, &b).await,
+        (Method::HEAD, Some(b), None) => bucket::head_bucket(state, &b).await,
         (Method::GET, Some(b), None) => listing::list_objects(state, &b, query).await,
 
         // Multipart upload
@@ -121,7 +128,6 @@ async fn handle(
             object::get_or_head_object(state, &b, &k, headers, false).await
         }
         (Method::HEAD, Some(b), Some(k)) => {
-            // For HEAD we still call the same path but suppress the body.
             let mut resp = object::get_or_head_object(state, &b, &k, headers, true).await?;
             *resp.body_mut() = Body::empty();
             Ok(resp)

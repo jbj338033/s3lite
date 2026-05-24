@@ -1,15 +1,17 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::http::error::{S3Error, S3ErrorCode};
-use crate::storage::manifest::BucketConfig;
+use crate::storage::manifest::{BucketConfig, VersioningState};
 use crate::storage::MetaError;
 
 use super::state::AppState;
 use super::xml::{
-    BucketEntry, Buckets, ListAllMyBucketsResult, LocationConstraint, Owner, XmlBody,
+    BucketEntry, Buckets, GetVersioningConfiguration, ListAllMyBucketsResult, LocationConstraint,
+    Owner, PutVersioningConfiguration, XmlBody,
 };
 
 const OWNER_ID: &str = "s3lite";
@@ -99,4 +101,63 @@ fn no_such_bucket(bucket: &str) -> S3Error {
 pub fn map_meta_err(e: MetaError) -> S3Error {
     tracing::error!(error = %e, "meta store error");
     S3Error::new(S3ErrorCode::InternalError, format!("meta: {e}"))
+}
+
+/// `PUT /bucket?versioning` with `<VersioningConfiguration>` body —
+/// switch the bucket between Off/Enabled/Suspended.
+pub async fn put_bucket_versioning(
+    state: AppState,
+    bucket: &str,
+    body: Bytes,
+) -> Result<Response, S3Error> {
+    let cfg: PutVersioningConfiguration = quick_xml::de::from_reader(body.as_ref())
+        .map_err(|e| {
+            S3Error::new(
+                S3ErrorCode::InvalidRequest,
+                format!("malformed VersioningConfiguration body: {e}"),
+            )
+            .with_resource(format!("/{bucket}"))
+        })?;
+    let new_state = match cfg.status.as_deref() {
+        Some("Enabled") => VersioningState::Enabled,
+        Some("Suspended") => VersioningState::Suspended,
+        Some(other) => {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidArgument,
+                format!("invalid versioning Status '{other}'"),
+            )
+            .with_resource(format!("/{bucket}")));
+        }
+        None => {
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidRequest,
+                "VersioningConfiguration must include a Status",
+            )
+            .with_resource(format!("/{bucket}")));
+        }
+    };
+    match state.meta.update_bucket_versioning(bucket, new_state).await {
+        Ok(()) => Ok(StatusCode::OK.into_response()),
+        Err(MetaError::BucketNotFound(_)) => Err(no_such_bucket(bucket)),
+        Err(e) => Err(map_meta_err(e)),
+    }
+}
+
+/// `GET /bucket?versioning` — return the current versioning state.
+pub async fn get_bucket_versioning(
+    state: AppState,
+    bucket: &str,
+) -> Result<Response, S3Error> {
+    let cfg = state
+        .meta
+        .get_bucket(bucket)
+        .await
+        .map_err(map_meta_err)?
+        .ok_or_else(|| no_such_bucket(bucket))?;
+    let status = match cfg.versioning {
+        VersioningState::Off => None,
+        VersioningState::Enabled => Some("Enabled".to_string()),
+        VersioningState::Suspended => Some("Suspended".to_string()),
+    };
+    Ok(XmlBody(GetVersioningConfiguration { status }).into_response())
 }
