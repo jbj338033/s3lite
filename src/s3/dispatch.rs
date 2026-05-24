@@ -96,6 +96,15 @@ async fn handle(
         (Method::GET, Some(b), None) if has_query_flag(query, "object-lock") => {
             lock::get_bucket_object_lock_config(state, &b).await
         }
+        (Method::PUT, Some(b), None) if has_query_flag(query, "lifecycle") => {
+            bucket::put_bucket_lifecycle(state, &b, body.clone()).await
+        }
+        (Method::GET, Some(b), None) if has_query_flag(query, "lifecycle") => {
+            bucket::get_bucket_lifecycle(state, &b).await
+        }
+        (Method::DELETE, Some(b), None) if has_query_flag(query, "lifecycle") => {
+            bucket::delete_bucket_lifecycle(state, &b).await
+        }
         (Method::OPTIONS, Some(b), _) => cors::preflight(state, &b, headers).await,
         // Bucket-level catch-alls
         (Method::PUT, Some(b), None) => bucket::create_bucket(state, &b, headers).await,
