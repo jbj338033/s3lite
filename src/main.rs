@@ -7,6 +7,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use rand::RngCore;
+use s3lite::admin;
 use s3lite::config::load_config;
 use s3lite::http::build_app;
 use s3lite::s3::AppState;
@@ -47,6 +48,25 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Snapshot a stopped data dir into another directory.
+    Backup {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Restore a backup snapshot into a new data dir.
+    Restore {
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Verify every part file's blake3 hash matches its filename.
+    ScanRebuild {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -81,6 +101,63 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Backup { data_dir, output } => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            match runtime.block_on(admin::backup(&data_dir, &output)) {
+                Ok(report) => {
+                    println!(
+                        "backup complete: buckets={} manifests={} parts_copied={} missing_parts={}",
+                        report.buckets,
+                        report.manifests,
+                        report.parts_copied,
+                        report.parts_missing.len(),
+                    );
+                    if !report.parts_missing.is_empty() {
+                        eprintln!("warning: {} part(s) referenced by manifests are missing on disk", report.parts_missing.len());
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("backup failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Restore { snapshot, data_dir } => match admin::restore(&snapshot, &data_dir) {
+            Ok(report) => {
+                println!("restore complete: parts_copied={}", report.parts_copied);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("restore failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::ScanRebuild { data_dir } => match admin::scan_rebuild(&data_dir) {
+            Ok(report) => {
+                println!(
+                    "scan complete: checked={} passed={} corrupted={}",
+                    report.parts_checked,
+                    report.parts_passed,
+                    report.corrupted.len(),
+                );
+                for name in &report.corrupted {
+                    eprintln!("corrupted: {name}");
+                }
+                if report.corrupted.is_empty() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(e) => {
+                eprintln!("scan failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
