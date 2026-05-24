@@ -274,6 +274,57 @@ pub struct DeleteMarkerEntry {
     pub last_modified: String,
 }
 
+// ---------------- Tagging ----------------
+
+/// Single `<Tag><Key>k</Key><Value>v</Value></Tag>` element.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tag {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "Value")]
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TagSet {
+    #[serde(rename = "Tag", default)]
+    pub tags: Vec<Tag>,
+}
+
+/// Request and response shape for `Get/Put ObjectTagging` and bucket tagging.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename = "Tagging")]
+pub struct Tagging {
+    #[serde(rename = "TagSet", default)]
+    pub tag_set: TagSet,
+}
+
+// ---------------- CORS ----------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename = "CORSRule")]
+pub struct CorsRuleXml {
+    #[serde(rename = "ID", default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "AllowedOrigin", default)]
+    pub allowed_origin: Vec<String>,
+    #[serde(rename = "AllowedMethod", default)]
+    pub allowed_method: Vec<String>,
+    #[serde(rename = "AllowedHeader", default)]
+    pub allowed_header: Vec<String>,
+    #[serde(rename = "ExposeHeader", default)]
+    pub expose_header: Vec<String>,
+    #[serde(rename = "MaxAgeSeconds", default, skip_serializing_if = "Option::is_none")]
+    pub max_age_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename = "CORSConfiguration")]
+pub struct CorsConfiguration {
+    #[serde(rename = "CORSRule", default)]
+    pub rules: Vec<CorsRuleXml>,
+}
+
 // ---------------- Copy ----------------
 
 /// Response body for `CopyObject`.
