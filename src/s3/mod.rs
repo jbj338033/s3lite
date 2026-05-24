@@ -4,6 +4,7 @@ pub mod checksum;
 pub mod copy;
 pub mod cors;
 pub mod dispatch;
+pub mod events;
 pub mod listing;
 pub mod lock;
 pub mod maintenance;
