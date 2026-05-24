@@ -274,6 +274,28 @@ impl MetaStore {
         self.dispatch(|reply| actor::Op::UpdateManifestTags { key, tags, reply })
             .await?
     }
+
+    pub async fn update_bucket_object_lock(
+        &self,
+        name: &str,
+        cfg: Option<crate::storage::manifest::ObjectLockConfig>,
+    ) -> Result<(), MetaError> {
+        self.dispatch(|reply| actor::Op::UpdateBucketObjectLock {
+            name: name.to_string(),
+            cfg,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn update_manifest_lock(
+        &self,
+        key: ManifestKey,
+        lock: Option<crate::storage::manifest::ObjectLock>,
+    ) -> Result<(), MetaError> {
+        self.dispatch(|reply| actor::Op::UpdateManifestLock { key, lock, reply })
+            .await?
+    }
 }
 
 impl Drop for MetaStore {

@@ -107,6 +107,16 @@ pub(super) enum Op {
         tags: std::collections::BTreeMap<String, String>,
         reply: Reply<Result<(), MetaError>>,
     },
+    UpdateBucketObjectLock {
+        name: String,
+        cfg: Option<crate::storage::manifest::ObjectLockConfig>,
+        reply: Reply<Result<(), MetaError>>,
+    },
+    UpdateManifestLock {
+        key: ManifestKey,
+        lock: Option<crate::storage::manifest::ObjectLock>,
+        reply: Reply<Result<(), MetaError>>,
+    },
 
     Shutdown,
 }
@@ -203,6 +213,12 @@ pub(super) fn run(
             }
             Op::UpdateManifestTags { key, tags, reply } => {
                 let _ = reply.send(handle_update_manifest_tags(&db, &key, tags));
+            }
+            Op::UpdateBucketObjectLock { name, cfg, reply } => {
+                let _ = reply.send(handle_update_bucket_object_lock(&db, &name, cfg));
+            }
+            Op::UpdateManifestLock { key, lock, reply } => {
+                let _ = reply.send(handle_update_manifest_lock(&db, &key, lock));
             }
         }
     }
@@ -874,6 +890,53 @@ fn handle_update_manifest_tags(
             bincode_decode(v.value())?
         };
         m.tags = tags;
+        let bytes = bincode_encode(&m)?;
+        objects.insert(key_bytes.as_slice(), bytes.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn handle_update_bucket_object_lock(
+    db: &Database,
+    name: &str,
+    cfg: Option<crate::storage::manifest::ObjectLockConfig>,
+) -> Result<(), MetaError> {
+    let tx = db.begin_write()?;
+    {
+        let mut table = tx.open_table(BUCKETS)?;
+        let mut bucket: BucketConfig = {
+            let Some(v) = table.get(name)? else {
+                return Err(MetaError::BucketNotFound(name.to_string()));
+            };
+            bincode_decode(v.value())?
+        };
+        bucket.object_lock = cfg;
+        let bytes = bincode_encode(&bucket)?;
+        table.insert(name, bytes.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Replace the manifest's `object_lock` field only — same metadata-only
+/// semantics as `update_manifest_tags`. Last-modified is left intact.
+fn handle_update_manifest_lock(
+    db: &Database,
+    key: &ManifestKey,
+    lock: Option<crate::storage::manifest::ObjectLock>,
+) -> Result<(), MetaError> {
+    let tx = db.begin_write()?;
+    {
+        let mut objects = tx.open_table(OBJECTS)?;
+        let key_bytes = key.encode();
+        let mut m: Manifest = {
+            let Some(v) = objects.get(key_bytes.as_slice())? else {
+                return Err(MetaError::ManifestNotFound(key.clone()));
+            };
+            bincode_decode(v.value())?
+        };
+        m.object_lock = lock;
         let bytes = bincode_encode(&m)?;
         objects.insert(key_bytes.as_slice(), bytes.as_slice())?;
     }
