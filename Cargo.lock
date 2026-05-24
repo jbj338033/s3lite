@@ -2314,6 +2314,7 @@ dependencies = [
  "crc32c",
  "crc32fast",
  "hex",
+ "hmac 0.12.1",
  "http 1.4.0",
  "http-body-util",
  "md-5 0.10.6",
