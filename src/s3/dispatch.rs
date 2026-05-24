@@ -125,14 +125,20 @@ async fn handle(
         // Object-level
         (Method::PUT, Some(b), Some(k)) => object::put_object(state, &b, &k, headers, body).await,
         (Method::GET, Some(b), Some(k)) => {
-            object::get_or_head_object(state, &b, &k, headers, false).await
+            let vid = query_value(query, "versionId");
+            object::get_or_head_object(state, &b, &k, vid.as_deref(), headers, false).await
         }
         (Method::HEAD, Some(b), Some(k)) => {
-            let mut resp = object::get_or_head_object(state, &b, &k, headers, true).await?;
+            let vid = query_value(query, "versionId");
+            let mut resp =
+                object::get_or_head_object(state, &b, &k, vid.as_deref(), headers, true).await?;
             *resp.body_mut() = Body::empty();
             Ok(resp)
         }
-        (Method::DELETE, Some(b), Some(k)) => object::delete_object(state, &b, &k).await,
+        (Method::DELETE, Some(b), Some(k)) => {
+            let vid = query_value(query, "versionId");
+            object::delete_object(state, &b, &k, vid.as_deref()).await
+        }
 
         _ => Err(S3Error::new(
             S3ErrorCode::NotImplemented,

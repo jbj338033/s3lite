@@ -8,10 +8,12 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use tokio::io::AsyncReadExt;
+use uuid::Uuid;
 
 use crate::http::error::{S3Error, S3ErrorCode};
 use crate::storage::manifest::{
-    Manifest, ManifestKey, ManifestKind, ManifestState, PartRef, UploadMode,
+    BucketConfig, Manifest, ManifestKey, ManifestKind, ManifestState, PartRef, UploadMode,
+    VersioningState,
 };
 
 use super::bucket::map_meta_err;
@@ -20,6 +22,15 @@ use super::state::AppState;
 
 const NULL_VERSION_ID: &str = "null";
 
+/// Generate a new version id based on bucket versioning state.
+/// Enabled → uuid v4 (32 hex chars). Off/Suspended → literal "null".
+fn next_version_id(state: VersioningState) -> String {
+    match state {
+        VersioningState::Enabled => Uuid::new_v4().simple().to_string(),
+        VersioningState::Off | VersioningState::Suspended => NULL_VERSION_ID.to_string(),
+    }
+}
+
 pub async fn put_object(
     state: AppState,
     bucket: &str,
@@ -27,7 +38,7 @@ pub async fn put_object(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response, S3Error> {
-    require_bucket(&state, bucket).await?;
+    let bucket_cfg = require_bucket(&state, bucket).await?;
     check_put_preconditions(&state, bucket, key, headers).await?;
 
     // Legacy Content-MD5 verification (S3 returns BadDigest on mismatch).
@@ -57,9 +68,10 @@ pub async fn put_object(
         .await
         .map_err(|e| S3Error::new(S3ErrorCode::InternalError, format!("part write: {e}")))?;
 
+    let version_id = next_version_id(bucket_cfg.versioning);
     let now = OffsetDateTime::now_utc();
     let manifest = Manifest {
-        key: ManifestKey::new(bucket, key, NULL_VERSION_ID),
+        key: ManifestKey::new(bucket, key, &version_id),
         state: ManifestState::Committed,
         kind: ManifestKind::Object,
         upload_mode: UploadMode::SinglePut,
@@ -92,6 +104,9 @@ pub async fn put_object(
     let mut resp = StatusCode::OK.into_response();
     let resp_headers = resp.headers_mut();
     set_header(resp_headers, "etag", &etag);
+    if matches!(bucket_cfg.versioning, VersioningState::Enabled) {
+        set_header(resp_headers, "x-amz-version-id", &version_id);
+    }
     if let Some(ac) = &additional_checksum {
         set_header(
             resp_headers,
@@ -106,19 +121,41 @@ pub async fn get_or_head_object(
     state: AppState,
     bucket: &str,
     key: &str,
+    version_id: Option<&str>,
     headers: &HeaderMap,
     body_only_headers: bool,
 ) -> Result<Response, S3Error> {
     require_bucket(&state, bucket).await?;
-    let manifest = state
-        .meta
-        .get_manifest(ManifestKey::new(bucket, key, NULL_VERSION_ID))
-        .await
-        .map_err(map_meta_err)?
-        .filter(|m| {
-            matches!(m.state, ManifestState::Committed) && matches!(m.kind, ManifestKind::Object)
-        })
-        .ok_or_else(|| no_such_key(bucket, key))?;
+    let manifest = match version_id {
+        Some(vid) => state
+            .meta
+            .get_manifest(ManifestKey::new(bucket, key, vid))
+            .await
+            .map_err(map_meta_err)?
+            .filter(|m| matches!(m.state, ManifestState::Committed))
+            .ok_or_else(|| no_such_key(bucket, key))?,
+        None => state
+            .meta
+            .get_latest_version(bucket, key)
+            .await
+            .map_err(map_meta_err)?
+            .ok_or_else(|| no_such_key(bucket, key))?,
+    };
+    // Tombstone = latest delete marker, surface as NoSuchKey (without versionId)
+    // or DeleteMarker response (with versionId targeting the marker itself).
+    if matches!(manifest.kind, ManifestKind::Tombstone) {
+        if version_id.is_none() {
+            return Err(no_such_key(bucket, key));
+        } else {
+            // Targeted GET on a delete marker — S3 returns 405 MethodNotAllowed
+            // with x-amz-delete-marker: true. Map to a clear error for now.
+            return Err(S3Error::new(
+                S3ErrorCode::InvalidRequest,
+                "the specified version is a delete marker",
+            )
+            .with_resource(format!("/{bucket}/{key}")));
+        }
+    }
 
     let etag = manifest.etag();
     if let Some(short_circuit) =
@@ -209,20 +246,94 @@ pub async fn delete_object(
     state: AppState,
     bucket: &str,
     key: &str,
+    version_id: Option<&str>,
 ) -> Result<Response, S3Error> {
-    require_bucket(&state, bucket).await?;
-    match state
-        .meta
-        .delete_manifest(ManifestKey::new(bucket, key, NULL_VERSION_ID))
-        .await
-    {
-        Ok(effect) => {
+    let bucket_cfg = require_bucket(&state, bucket).await?;
+
+    // Targeted version delete is always a permanent removal — bypasses
+    // tombstone semantics.
+    if let Some(vid) = version_id {
+        return delete_specific_version(&state, bucket, key, vid).await;
+    }
+
+    match bucket_cfg.versioning {
+        VersioningState::Off => {
+            match state
+                .meta
+                .delete_manifest(ManifestKey::new(bucket, key, NULL_VERSION_ID))
+                .await
+            {
+                Ok(effect) => {
+                    gc_freed_parts(&state, &effect.freed_parts).await;
+                    Ok(StatusCode::NO_CONTENT.into_response())
+                }
+                Err(crate::storage::MetaError::ManifestNotFound(_)) => {
+                    Ok(StatusCode::NO_CONTENT.into_response())
+                }
+                Err(e) => Err(map_meta_err(e)),
+            }
+        }
+        VersioningState::Enabled | VersioningState::Suspended => {
+            // Insert a delete marker (tombstone). Enabled gets a fresh uuid;
+            // Suspended overwrites the "null" version slot.
+            let tombstone_version = next_version_id(bucket_cfg.versioning);
+            let now = OffsetDateTime::now_utc();
+            let tombstone = Manifest {
+                key: ManifestKey::new(bucket, key, &tombstone_version),
+                state: ManifestState::Committed,
+                kind: ManifestKind::Tombstone,
+                upload_mode: UploadMode::SinglePut,
+                parts: Vec::new(),
+                size: 0,
+                content_type: None,
+                user_metadata: BTreeMap::new(),
+                tags: BTreeMap::new(),
+                additional_checksum: None,
+                storage_class: "STANDARD".into(),
+                object_lock: None,
+                created_at: now,
+                last_modified: now,
+                upload_id: None,
+            };
+            let effect = state.meta.put_manifest(tombstone).await.map_err(map_meta_err)?;
             gc_freed_parts(&state, &effect.freed_parts).await;
-            Ok(StatusCode::NO_CONTENT.into_response())
+            let mut resp = StatusCode::NO_CONTENT.into_response();
+            set_header(resp.headers_mut(), "x-amz-delete-marker", "true");
+            if matches!(bucket_cfg.versioning, VersioningState::Enabled) {
+                set_header(resp.headers_mut(), "x-amz-version-id", &tombstone_version);
+            }
+            Ok(resp)
+        }
+    }
+}
+
+async fn delete_specific_version(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Response, S3Error> {
+    let target = ManifestKey::new(bucket, key, version_id);
+    let maybe = state.meta.get_manifest(target.clone()).await.map_err(map_meta_err)?;
+    let is_delete_marker = matches!(
+        maybe.as_ref().map(|m| m.kind),
+        Some(ManifestKind::Tombstone)
+    );
+    match state.meta.delete_manifest(target).await {
+        Ok(effect) => {
+            gc_freed_parts(state, &effect.freed_parts).await;
+            let mut resp = StatusCode::NO_CONTENT.into_response();
+            set_header(resp.headers_mut(), "x-amz-version-id", version_id);
+            if is_delete_marker {
+                set_header(resp.headers_mut(), "x-amz-delete-marker", "true");
+            }
+            Ok(resp)
         }
         Err(crate::storage::MetaError::ManifestNotFound(_)) => {
-            // S3 returns 204 even on deleting a non-existent key.
-            Ok(StatusCode::NO_CONTENT.into_response())
+            // S3 returns 204 for delete of non-existent version too.
+            let mut resp = StatusCode::NO_CONTENT.into_response();
+            set_header(resp.headers_mut(), "x-amz-version-id", version_id);
+            Ok(resp)
         }
         Err(e) => Err(map_meta_err(e)),
     }
@@ -230,18 +341,16 @@ pub async fn delete_object(
 
 // ---------------- helpers ----------------
 
-async fn require_bucket(state: &AppState, bucket: &str) -> Result<(), S3Error> {
-    if state
+async fn require_bucket(state: &AppState, bucket: &str) -> Result<BucketConfig, S3Error> {
+    state
         .meta
         .get_bucket(bucket)
         .await
         .map_err(map_meta_err)?
-        .is_none()
-    {
-        return Err(S3Error::new(S3ErrorCode::NoSuchBucket, "bucket does not exist")
-            .with_resource(format!("/{bucket}")));
-    }
-    Ok(())
+        .ok_or_else(|| {
+            S3Error::new(S3ErrorCode::NoSuchBucket, "bucket does not exist")
+                .with_resource(format!("/{bucket}"))
+        })
 }
 
 fn no_such_key(bucket: &str, key: &str) -> S3Error {
