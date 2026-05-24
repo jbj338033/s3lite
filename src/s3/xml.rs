@@ -220,3 +220,81 @@ pub struct ListPartsResult {
     #[serde(rename = "Part", default)]
     pub parts: Vec<ListPartsPart>,
 }
+
+// ---------------- Versioning ----------------
+
+/// Request body for `PutBucketVersioning`. Only `Status` is supported in
+/// Phase 7 (MfaDelete left out — single-key auth model has no MFA concept).
+#[derive(Debug, Deserialize)]
+#[serde(rename = "VersioningConfiguration")]
+pub struct PutVersioningConfiguration {
+    #[serde(rename = "Status", default)]
+    pub status: Option<String>,
+}
+
+/// Response body for `GetBucketVersioning`. Empty body means "Off" in S3 —
+/// we emit a Status only when versioning has been touched.
+#[derive(Debug, Serialize)]
+#[serde(rename = "VersioningConfiguration")]
+pub struct GetVersioningConfiguration {
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// Single entry in `ListVersionsResult` — either an object version or a
+/// delete marker (tombstone). Both share the same shape; serde renames
+/// dispatch via untagged is awkward, so they're separate vecs in the parent.
+#[derive(Debug, Serialize)]
+pub struct ObjectVersion {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "VersionId")]
+    pub version_id: String,
+    #[serde(rename = "IsLatest")]
+    pub is_latest: bool,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "Size")]
+    pub size: u64,
+    #[serde(rename = "StorageClass")]
+    pub storage_class: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteMarkerEntry {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "VersionId")]
+    pub version_id: String,
+    #[serde(rename = "IsLatest")]
+    pub is_latest: bool,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListVersionsResult")]
+pub struct ListVersionsResult {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Prefix")]
+    pub prefix: String,
+    #[serde(rename = "KeyMarker")]
+    pub key_marker: String,
+    #[serde(rename = "MaxKeys")]
+    pub max_keys: u32,
+    #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(rename = "IsTruncated")]
+    pub is_truncated: bool,
+    #[serde(rename = "EncodingType", skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
+    #[serde(rename = "NextKeyMarker", skip_serializing_if = "Option::is_none")]
+    pub next_key_marker: Option<String>,
+    #[serde(rename = "Version", default)]
+    pub versions: Vec<ObjectVersion>,
+    #[serde(rename = "DeleteMarker", default)]
+    pub delete_markers: Vec<DeleteMarkerEntry>,
+}
