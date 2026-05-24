@@ -5,12 +5,13 @@ use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::storage::manifest::{
-    BucketConfig, DeletionEffect, Hash, Manifest, ManifestKey, ManifestState, PartEntry, PartRef,
-    PartState,
+    BucketConfig, DeletionEffect, Hash, Manifest, ManifestKey, ManifestKind, ManifestState,
+    PartEntry, PartRef, PartState,
 };
 
 use super::errors::MetaError;
 use super::tables::{BUCKETS, EVENTS_DLQ, OBJECTS, PARTS, SERVER_META};
+use super::{ListCursor, ListItem, ListObjectsPage, ListObjectsRequest};
 
 type Reply<T> = oneshot::Sender<T>;
 
@@ -69,6 +70,10 @@ pub(super) enum Op {
     },
     ListGcPendingParts {
         reply: Reply<Result<Vec<Hash>, MetaError>>,
+    },
+    ListObjects {
+        request: ListObjectsRequest,
+        reply: Reply<Result<ListObjectsPage, MetaError>>,
     },
 
     Shutdown,
@@ -133,6 +138,9 @@ pub(super) fn run(
             }
             Op::ListGcPendingParts { reply } => {
                 let _ = reply.send(handle_list_gc_pending(&db));
+            }
+            Op::ListObjects { request, reply } => {
+                let _ = reply.send(handle_list_objects(&db, &request));
             }
         }
     }
@@ -401,6 +409,123 @@ fn handle_remove_part(db: &Database, hash: &Hash) -> Result<(), MetaError> {
     }
     tx.commit()?;
     Ok(())
+}
+
+fn handle_list_objects(
+    db: &Database,
+    req: &ListObjectsRequest,
+) -> Result<ListObjectsPage, MetaError> {
+    let tx = db.begin_read()?;
+    let table = tx.open_table(OBJECTS)?;
+
+    let scan_start = match &req.cursor {
+        None => initial_scan_start(&req.bucket, &req.prefix),
+        Some(ListCursor::AfterKey(k)) => after_key(&req.bucket, k),
+        Some(ListCursor::AfterPrefix(p)) => after_prefix(&req.bucket, p),
+    };
+    let scan_end = {
+        let mut v = req.bucket.as_bytes().to_vec();
+        v.push(1);
+        v
+    };
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut truncated = false;
+    let mut next_cursor: Option<ListCursor> = None;
+    let mut skip_prefix: Option<String> = None;
+
+    for entry in table.range(scan_start.as_slice()..scan_end.as_slice())? {
+        let (_k, v) = entry?;
+        let manifest: Manifest = bincode_decode(v.value())?;
+
+        if !matches!(manifest.state, ManifestState::Committed)
+            || !matches!(manifest.kind, ManifestKind::Object)
+            || manifest.key.version_id != "null"
+        {
+            continue;
+        }
+        if !manifest.key.key.starts_with(&req.prefix) {
+            break;
+        }
+        if let Some(skip) = &skip_prefix {
+            if manifest.key.key.starts_with(skip.as_str()) {
+                continue;
+            }
+            skip_prefix = None;
+        }
+
+        // If we've already filled `limit` items, this entry would overflow —
+        // mark truncated and emit a cursor pointing AFTER the last item we
+        // already pushed (not after this current entry, which has to be
+        // returned on the next page).
+        if items.len() >= req.limit {
+            truncated = true;
+            next_cursor = items.last().map(|item| match item {
+                ListItem::Object(m) => ListCursor::AfterKey(m.key.key.clone()),
+                ListItem::CommonPrefix(p) => ListCursor::AfterPrefix(p.clone()),
+            });
+            break;
+        }
+
+        if let Some(delim) = &req.delimiter {
+            let after_prefix = &manifest.key.key[req.prefix.len()..];
+            if let Some(pos) = after_prefix.find(delim.as_str()) {
+                let common_end = req.prefix.len() + pos + delim.len();
+                let common_prefix = manifest.key.key[..common_end].to_string();
+                items.push(ListItem::CommonPrefix(common_prefix.clone()));
+                skip_prefix = Some(common_prefix);
+                continue;
+            }
+        }
+
+        items.push(ListItem::Object(Box::new(manifest)));
+    }
+
+    Ok(ListObjectsPage {
+        items,
+        truncated,
+        next_cursor,
+    })
+}
+
+fn initial_scan_start(bucket: &str, prefix: &str) -> Vec<u8> {
+    let mut v = bucket.as_bytes().to_vec();
+    v.push(0);
+    v.extend_from_slice(prefix.as_bytes());
+    v
+}
+
+/// Cursor strictly greater than `bucket\0key\0<anything>` — skips all
+/// version_ids of `key` while still including `key` extensions like
+/// `key0`, `key1` (S3 `start-after` semantics).
+fn after_key(bucket: &str, key: &str) -> Vec<u8> {
+    let mut v = bucket.as_bytes().to_vec();
+    v.push(0);
+    v.extend_from_slice(key.as_bytes());
+    v.push(1);
+    v
+}
+
+/// Cursor lex-greater than every key starting with `prefix` in this bucket —
+/// used to jump past a `CommonPrefix` group.
+fn after_prefix(bucket: &str, prefix: &str) -> Vec<u8> {
+    let mut v = bucket.as_bytes().to_vec();
+    v.push(0);
+    if prefix.is_empty() {
+        v.push(1);
+        return v;
+    }
+    let bytes = prefix.as_bytes();
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] < 0xff {
+            v.extend_from_slice(&bytes[..i]);
+            v.push(bytes[i] + 1);
+            return v;
+        }
+    }
+    v.extend_from_slice(bytes);
+    v.push(1);
+    v
 }
 
 fn handle_list_gc_pending(db: &Database) -> Result<Vec<Hash>, MetaError> {

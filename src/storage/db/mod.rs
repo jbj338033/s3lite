@@ -13,6 +13,46 @@ mod tables;
 
 pub use errors::MetaError;
 
+/// Encodes where to resume a `ListObjects` scan. Two distinct semantics —
+/// they need different cursor positions in the underlying byte key space.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum ListCursor {
+    /// S3 `start-after` / `marker` semantics: return keys strictly lex-greater
+    /// than this key (skips all version_ids of this exact key).
+    AfterKey(String),
+    /// Skip every key starting with this prefix; used after emitting a
+    /// `CommonPrefix` entry to jump past its members.
+    AfterPrefix(String),
+}
+
+/// Request body for `MetaStore::list_objects`.
+#[derive(Debug, Clone)]
+pub struct ListObjectsRequest {
+    pub bucket: String,
+    pub prefix: String,
+    pub delimiter: Option<String>,
+    pub cursor: Option<ListCursor>,
+    pub limit: usize,
+}
+
+/// Single entry in a `ListObjectsPage`. `Manifest` is boxed because it dwarfs
+/// the other variant (~310 bytes vs the inline `String`); without the box
+/// every list entry would pay full manifest size in memory.
+#[derive(Debug, Clone)]
+pub enum ListItem {
+    Object(Box<Manifest>),
+    CommonPrefix(String),
+}
+
+/// One page of a `ListObjects` scan.
+#[derive(Debug, Clone)]
+pub struct ListObjectsPage {
+    pub items: Vec<ListItem>,
+    pub truncated: bool,
+    /// The cursor for fetching the next page; `None` when no more results.
+    pub next_cursor: Option<ListCursor>,
+}
+
 /// Async facade over the redb actor thread.
 ///
 /// `redb::Database` is owned exclusively by a dedicated OS thread (outside the
@@ -134,6 +174,14 @@ impl MetaStore {
 
     pub async fn list_gc_pending_parts(&self) -> Result<Vec<Hash>, MetaError> {
         self.dispatch(|reply| actor::Op::ListGcPendingParts { reply })
+            .await?
+    }
+
+    pub async fn list_objects(
+        &self,
+        request: ListObjectsRequest,
+    ) -> Result<ListObjectsPage, MetaError> {
+        self.dispatch(|reply| actor::Op::ListObjects { request, reply })
             .await?
     }
 }
