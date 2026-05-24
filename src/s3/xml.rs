@@ -274,6 +274,28 @@ pub struct DeleteMarkerEntry {
     pub last_modified: String,
 }
 
+// ---------------- Copy ----------------
+
+/// Response body for `CopyObject`.
+#[derive(Debug, Serialize)]
+#[serde(rename = "CopyObjectResult")]
+pub struct CopyObjectResult {
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+}
+
+/// Response body for `UploadPartCopy`.
+#[derive(Debug, Serialize)]
+#[serde(rename = "CopyPartResult")]
+pub struct CopyPartResult {
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename = "ListVersionsResult")]
 pub struct ListVersionsResult {
