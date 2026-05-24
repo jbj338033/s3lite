@@ -1,6 +1,6 @@
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::http::error::{S3Error, S3ErrorCode};
 
@@ -147,4 +147,76 @@ pub struct ListBucketResultV1 {
     pub contents: Vec<ObjectContent>,
     #[serde(rename = "CommonPrefixes", default)]
     pub common_prefixes: Vec<CommonPrefix>,
+}
+
+// ---------------- Multipart upload ----------------
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "InitiateMultipartUploadResult")]
+pub struct InitiateMultipartUploadResult {
+    #[serde(rename = "Bucket")]
+    pub bucket: String,
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "UploadId")]
+    pub upload_id: String,
+}
+
+/// Request body for `CompleteMultipartUpload`. AWS sends the parts list the
+/// client decided to keep (etag + part number), in ascending part_number order.
+#[derive(Debug, Deserialize)]
+#[serde(rename = "CompleteMultipartUpload")]
+pub struct CompleteMultipartUploadRequest {
+    #[serde(rename = "Part", default)]
+    pub parts: Vec<CompletePart>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompletePart {
+    #[serde(rename = "PartNumber")]
+    pub part_number: u32,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "CompleteMultipartUploadResult")]
+pub struct CompleteMultipartUploadResult {
+    #[serde(rename = "Location")]
+    pub location: String,
+    #[serde(rename = "Bucket")]
+    pub bucket: String,
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListPartsPart {
+    #[serde(rename = "PartNumber")]
+    pub part_number: u32,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "Size")]
+    pub size: u64,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListPartsResult")]
+pub struct ListPartsResult {
+    #[serde(rename = "Bucket")]
+    pub bucket: String,
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "UploadId")]
+    pub upload_id: String,
+    #[serde(rename = "MaxParts")]
+    pub max_parts: u32,
+    #[serde(rename = "IsTruncated")]
+    pub is_truncated: bool,
+    #[serde(rename = "Part", default)]
+    pub parts: Vec<ListPartsPart>,
 }
