@@ -13,6 +13,7 @@ use s3lite::config::ServerConfig;
 use s3lite::http::build_app;
 use s3lite::s3::AppState;
 use s3lite::storage::{MetaStore, PartStore};
+use s3lite::s3::maintenance::{sweep_at, sweep_gc};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -25,6 +26,7 @@ struct Harness {
     _server: tokio::task::JoinHandle<()>,
     client: Client,
     endpoint: String,
+    state: AppState,
 }
 
 async fn start_server() -> Harness {
@@ -45,7 +47,7 @@ async fn start_server() -> Harness {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = build_app(state);
+    let app = build_app(state.clone());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -69,6 +71,7 @@ async fn start_server() -> Harness {
         _server: server,
         client,
         endpoint: endpoint_str,
+        state,
     }
 }
 
@@ -2352,3 +2355,210 @@ async fn compliance_retention_cannot_be_shortened() {
     );
 }
 
+
+// ---------------- Phase 11: lifecycle ----------------
+
+#[tokio::test]
+async fn lifecycle_put_get_roundtrip() {
+    let h = start_server().await;
+    let bucket = "lc-rt";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    let rule = aws_sdk_s3::types::LifecycleRule::builder()
+        .id("rule-1")
+        .status(aws_sdk_s3::types::ExpirationStatus::Enabled)
+        .filter(
+            aws_sdk_s3::types::LifecycleRuleFilter::builder()
+                .prefix("logs/")
+                .build(),
+        )
+        .expiration(
+            aws_sdk_s3::types::LifecycleExpiration::builder()
+                .days(30)
+                .build(),
+        )
+        .build()
+        .unwrap();
+    h.client
+        .put_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .lifecycle_configuration(
+            aws_sdk_s3::types::BucketLifecycleConfiguration::builder()
+                .rules(rule)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("put_bucket_lifecycle_configuration");
+
+    let resp = h
+        .client
+        .get_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("get_bucket_lifecycle_configuration");
+    let rules = resp.rules();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].id(), Some("rule-1"));
+    assert_eq!(rules[0].expiration().and_then(|e| e.days()), Some(30));
+}
+
+#[tokio::test]
+async fn lifecycle_expiration_tombstones_current_version() {
+    let h = start_server().await;
+    let bucket = "lc-exp";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    enable_versioning(&h, bucket).await;
+    h.client
+        .put_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .lifecycle_configuration(
+            aws_sdk_s3::types::BucketLifecycleConfiguration::builder()
+                .rules(
+                    aws_sdk_s3::types::LifecycleRule::builder()
+                        .id("expire-1d")
+                        .status(aws_sdk_s3::types::ExpirationStatus::Enabled)
+                        .filter(
+                            aws_sdk_s3::types::LifecycleRuleFilter::builder()
+                                .prefix(String::new())
+                                .build(),
+                        )
+                        .expiration(
+                            aws_sdk_s3::types::LifecycleExpiration::builder().days(1).build(),
+                        )
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"data".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    let future = time::OffsetDateTime::now_utc() + time::Duration::days(2);
+    let report = sweep_at(&h.state, future).await.expect("sweep_at");
+    assert_eq!(report.expired_current, 1, "should have expired one current version");
+
+    let err = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("k")
+        .send()
+        .await
+        .expect_err("after expiration GET should fail");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("NoSuchKey"), "expected NoSuchKey, got {msg}");
+}
+
+#[tokio::test]
+async fn lifecycle_aborts_old_multipart_uploads() {
+    let h = start_server().await;
+    let bucket = "lc-abort";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .lifecycle_configuration(
+            aws_sdk_s3::types::BucketLifecycleConfiguration::builder()
+                .rules(
+                    aws_sdk_s3::types::LifecycleRule::builder()
+                        .id("abort-1d")
+                        .status(aws_sdk_s3::types::ExpirationStatus::Enabled)
+                        .filter(
+                            aws_sdk_s3::types::LifecycleRuleFilter::builder()
+                                .prefix(String::new())
+                                .build(),
+                        )
+                        .abort_incomplete_multipart_upload(
+                            aws_sdk_s3::types::AbortIncompleteMultipartUpload::builder()
+                                .days_after_initiation(1)
+                                .build(),
+                        )
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let init = h
+        .client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key("k")
+        .send()
+        .await
+        .unwrap();
+    let upload_id = init.upload_id().unwrap().to_string();
+    h.client
+        .upload_part()
+        .bucket(bucket)
+        .key("k")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(b"data".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    let future = time::OffsetDateTime::now_utc() + time::Duration::days(2);
+    let report = sweep_at(&h.state, future).await.expect("sweep_at");
+    assert_eq!(report.aborted_multipart, 1, "should have aborted one upload");
+
+    let err = h
+        .client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key("k")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .parts(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag("\"deadbeef\"")
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect_err("complete after abort should fail");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("NoSuchUpload"), "expected NoSuchUpload, got {msg}");
+}
+
+#[tokio::test]
+async fn sweep_gc_idempotent_after_inline_gc() {
+    let h = start_server().await;
+    let bucket = "gc-orphans";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"abc".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    h.client.delete_object().bucket(bucket).key("k").send().await.unwrap();
+    let first = sweep_gc(&h.state).await.unwrap();
+    let second = sweep_gc(&h.state).await.unwrap();
+    assert_eq!(first, 0, "inline GC already cleaned this part");
+    assert_eq!(second, 0);
+}
