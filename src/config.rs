@@ -52,6 +52,14 @@ pub struct WebhookSubscription {
     pub url: String,
 }
 
+/// TLS termination settings. When set, the server binds with rustls and
+/// presents the configured cert chain; when `None`, plain HTTP only.
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub region: String,
@@ -74,6 +82,9 @@ pub struct ServerConfig {
     /// loopback / private / link-local IPs. Tests flip this on so they can
     /// run a local HTTP sink on 127.0.0.1.
     pub allow_loopback_webhooks: bool,
+    /// Optional TLS settings — `None` means serve plain HTTP. `Some` means
+    /// rustls self-terminate using the given PEM cert + key.
+    pub tls: Option<TlsConfig>,
 }
 
 impl ServerConfig {
@@ -94,6 +105,7 @@ impl ServerConfig {
             max_signed_body_bytes: 64 * 1024 * 1024,
             webhook_subscriptions: Vec::new(),
             allow_loopback_webhooks: false,
+            tls: None,
         })
     }
 }
@@ -115,6 +127,10 @@ pub struct ConfigFile {
     pub max_signed_body_bytes: Option<usize>,
     #[serde(default)]
     pub allow_loopback_webhooks: bool,
+    #[serde(default)]
+    pub tls_cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_key_path: Option<PathBuf>,
     #[serde(default, rename = "webhook")]
     pub webhooks: Vec<WebhookFile>,
 }
@@ -140,6 +156,8 @@ pub enum ConfigError {
     Toml(#[from] toml::de::Error),
     #[error("unknown event type '{0}'")]
     UnknownEventType(String),
+    #[error("tls_cert_path and tls_key_path must both be set or both omitted")]
+    PartialTlsConfig,
 }
 
 /// Parse a TOML config file into the runtime config + data dir path.
@@ -160,6 +178,14 @@ pub fn load_config(path: &Path) -> Result<(Arc<ServerConfig>, PathBuf), ConfigEr
             url: w.url,
         });
     }
+    let tls = match (file.tls_cert_path, file.tls_key_path) {
+        (Some(cert), Some(key)) => Some(TlsConfig {
+            cert_path: cert,
+            key_path: key,
+        }),
+        (None, None) => None,
+        _ => return Err(ConfigError::PartialTlsConfig),
+    };
     let cfg = ServerConfig {
         region: file.region,
         root_key: RootKey {
@@ -173,6 +199,7 @@ pub fn load_config(path: &Path) -> Result<(Arc<ServerConfig>, PathBuf), ConfigEr
             .unwrap_or(64 * 1024 * 1024),
         webhook_subscriptions: subs,
         allow_loopback_webhooks: file.allow_loopback_webhooks,
+        tls,
     };
     Ok((Arc::new(cfg), file.data_dir))
 }
