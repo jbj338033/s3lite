@@ -69,6 +69,7 @@ pub async fn create_bucket(
         region: state.config.region.clone(),
         cors_rules: Vec::new(),
         object_lock,
+        lifecycle_rules: Vec::new(),
     };
     match state.meta.create_bucket(bucket, cfg).await {
         Ok(()) => {

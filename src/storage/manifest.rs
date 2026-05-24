@@ -159,6 +159,45 @@ pub enum VersioningState {
     Suspended,
 }
 
+/// Bucket-level lifecycle rule. Phase 11 supports the three most common
+/// actions: object expiration, noncurrent-version expiration, and aborting
+/// long-lived in-progress multipart uploads. Filter is a simple key prefix
+/// (richer filters land in later phases).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleRule {
+    pub id: Option<String>,
+    pub status: LifecycleStatus,
+    pub filter_prefix: Option<String>,
+    pub expiration: Option<LifecycleExpiration>,
+    pub noncurrent_version_expiration: Option<NoncurrentVersionExpiration>,
+    pub abort_incomplete_multipart_upload: Option<AbortIncompleteMultipart>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LifecycleStatus {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleExpiration {
+    /// Number of days after object creation when it expires.
+    pub days: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoncurrentVersionExpiration {
+    /// Number of days after a version became noncurrent. We approximate this
+    /// with the version's `created_at` (we don't track demotion time).
+    pub noncurrent_days: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbortIncompleteMultipart {
+    pub days_after_initiation: u32,
+}
+
 /// Bucket-level Object Lock configuration. `enabled` is set at bucket
 /// creation time (via `x-amz-bucket-object-lock-enabled: true`) and is
 /// immutable thereafter — only `default_retention` can change.
@@ -198,6 +237,8 @@ pub struct BucketConfig {
     pub cors_rules: Vec<CorsRule>,
     #[serde(default)]
     pub object_lock: Option<ObjectLockConfig>,
+    #[serde(default)]
+    pub lifecycle_rules: Vec<LifecycleRule>,
 }
 
 impl BucketConfig {
@@ -208,6 +249,7 @@ impl BucketConfig {
             region: region.into(),
             cors_rules: Vec::new(),
             object_lock: None,
+            lifecycle_rules: Vec::new(),
         }
     }
 }
