@@ -1,0 +1,491 @@
+use std::path::PathBuf;
+
+use redb::{Database, ReadableTable};
+use time::OffsetDateTime;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::storage::manifest::{
+    BucketConfig, DeletionEffect, Hash, Manifest, ManifestKey, ManifestState, PartEntry, PartRef,
+    PartState,
+};
+
+use super::errors::MetaError;
+use super::tables::{BUCKETS, EVENTS_DLQ, OBJECTS, PARTS, SERVER_META};
+
+type Reply<T> = oneshot::Sender<T>;
+
+pub(super) enum Op {
+    CreateBucket {
+        name: String,
+        config: BucketConfig,
+        reply: Reply<Result<(), MetaError>>,
+    },
+    GetBucket {
+        name: String,
+        reply: Reply<Result<Option<BucketConfig>, MetaError>>,
+    },
+    DeleteBucket {
+        name: String,
+        reply: Reply<Result<(), MetaError>>,
+    },
+    ListBuckets {
+        reply: Reply<Result<Vec<(String, BucketConfig)>, MetaError>>,
+    },
+
+    PutManifest {
+        manifest: Manifest,
+        reply: Reply<Result<DeletionEffect, MetaError>>,
+    },
+    GetManifest {
+        key: ManifestKey,
+        reply: Reply<Result<Option<Manifest>, MetaError>>,
+    },
+    DeleteManifest {
+        key: ManifestKey,
+        reply: Reply<Result<DeletionEffect, MetaError>>,
+    },
+    UpdateManifestState {
+        key: ManifestKey,
+        new_state: ManifestState,
+        reply: Reply<Result<(), MetaError>>,
+    },
+    AppendPart {
+        key: ManifestKey,
+        part: PartRef,
+        reply: Reply<Result<DeletionEffect, MetaError>>,
+    },
+
+    GetPart {
+        hash: Hash,
+        reply: Reply<Result<Option<PartEntry>, MetaError>>,
+    },
+    MarkPartGcPending {
+        hash: Hash,
+        reply: Reply<Result<bool, MetaError>>,
+    },
+    RemovePart {
+        hash: Hash,
+        reply: Reply<Result<(), MetaError>>,
+    },
+    ListGcPendingParts {
+        reply: Reply<Result<Vec<Hash>, MetaError>>,
+    },
+
+    Shutdown,
+}
+
+pub(super) fn run(
+    path: PathBuf,
+    mut receiver: mpsc::Receiver<Op>,
+    ready: oneshot::Sender<Result<(), MetaError>>,
+) {
+    let db = match Database::create(&path) {
+        Ok(db) => db,
+        Err(e) => {
+            let _ = ready.send(Err(MetaError::Redb(e.to_string())));
+            return;
+        }
+    };
+    if let Err(e) = bootstrap_tables(&db) {
+        let _ = ready.send(Err(e));
+        return;
+    }
+    let _ = ready.send(Ok(()));
+
+    while let Some(op) = receiver.blocking_recv() {
+        match op {
+            Op::Shutdown => break,
+            Op::CreateBucket { name, config, reply } => {
+                let _ = reply.send(handle_create_bucket(&db, &name, &config));
+            }
+            Op::GetBucket { name, reply } => {
+                let _ = reply.send(handle_get_bucket(&db, &name));
+            }
+            Op::DeleteBucket { name, reply } => {
+                let _ = reply.send(handle_delete_bucket(&db, &name));
+            }
+            Op::ListBuckets { reply } => {
+                let _ = reply.send(handle_list_buckets(&db));
+            }
+            Op::PutManifest { manifest, reply } => {
+                let _ = reply.send(handle_put_manifest(&db, &manifest));
+            }
+            Op::GetManifest { key, reply } => {
+                let _ = reply.send(handle_get_manifest(&db, &key));
+            }
+            Op::DeleteManifest { key, reply } => {
+                let _ = reply.send(handle_delete_manifest(&db, &key));
+            }
+            Op::UpdateManifestState { key, new_state, reply } => {
+                let _ = reply.send(handle_update_state(&db, &key, new_state));
+            }
+            Op::AppendPart { key, part, reply } => {
+                let _ = reply.send(handle_append_part(&db, &key, &part));
+            }
+            Op::GetPart { hash, reply } => {
+                let _ = reply.send(handle_get_part(&db, &hash));
+            }
+            Op::MarkPartGcPending { hash, reply } => {
+                let _ = reply.send(handle_mark_gc_pending(&db, &hash));
+            }
+            Op::RemovePart { hash, reply } => {
+                let _ = reply.send(handle_remove_part(&db, &hash));
+            }
+            Op::ListGcPendingParts { reply } => {
+                let _ = reply.send(handle_list_gc_pending(&db));
+            }
+        }
+    }
+}
+
+fn bootstrap_tables(db: &Database) -> Result<(), MetaError> {
+    let tx = db.begin_write()?;
+    let _ = tx.open_table(BUCKETS)?;
+    let _ = tx.open_table(OBJECTS)?;
+    let _ = tx.open_table(PARTS)?;
+    let _ = tx.open_table(SERVER_META)?;
+    let _ = tx.open_table(EVENTS_DLQ)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn handle_create_bucket(db: &Database, name: &str, config: &BucketConfig) -> Result<(), MetaError> {
+    let tx = db.begin_write()?;
+    {
+        let mut table = tx.open_table(BUCKETS)?;
+        if table.get(name)?.is_some() {
+            return Err(MetaError::BucketExists(name.to_string()));
+        }
+        let bytes = bincode_encode(config)?;
+        table.insert(name, bytes.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn handle_get_bucket(db: &Database, name: &str) -> Result<Option<BucketConfig>, MetaError> {
+    let tx = db.begin_read()?;
+    let table = tx.open_table(BUCKETS)?;
+    let Some(v) = table.get(name)? else { return Ok(None) };
+    let config: BucketConfig = bincode_decode(v.value())?;
+    Ok(Some(config))
+}
+
+fn handle_delete_bucket(db: &Database, name: &str) -> Result<(), MetaError> {
+    let tx = db.begin_write()?;
+    {
+        let mut buckets = tx.open_table(BUCKETS)?;
+        if buckets.get(name)?.is_none() {
+            return Err(MetaError::BucketNotFound(name.to_string()));
+        }
+        // empty-check via prefix scan in OBJECTS table
+        {
+            let objects = tx.open_table(OBJECTS)?;
+            let mut start = name.as_bytes().to_vec();
+            start.push(0);
+            let mut end = name.as_bytes().to_vec();
+            end.push(1);
+            let mut iter = objects.range(start.as_slice()..end.as_slice())?;
+            if iter.next().is_some() {
+                return Err(MetaError::BucketNotEmpty(name.to_string()));
+            }
+        }
+        buckets.remove(name)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn handle_list_buckets(db: &Database) -> Result<Vec<(String, BucketConfig)>, MetaError> {
+    let tx = db.begin_read()?;
+    let table = tx.open_table(BUCKETS)?;
+    let mut result = Vec::new();
+    for entry in table.iter()? {
+        let (k, v) = entry?;
+        let name = k.value().to_string();
+        let config: BucketConfig = bincode_decode(v.value())?;
+        result.push((name, config));
+    }
+    Ok(result)
+}
+
+fn handle_put_manifest(db: &Database, manifest: &Manifest) -> Result<DeletionEffect, MetaError> {
+    let tx = db.begin_write()?;
+    let mut freed = Vec::new();
+    {
+        let mut objects = tx.open_table(OBJECTS)?;
+        let mut parts = tx.open_table(PARTS)?;
+
+        let key_bytes = manifest.key.encode();
+
+        // Load old manifest (if replacing)
+        let old: Option<Manifest> = {
+            if let Some(v) = objects.get(key_bytes.as_slice())? {
+                Some(bincode_decode(v.value())?)
+            } else {
+                None
+            }
+        };
+
+        // Increment refcount for every part referenced by the new manifest.
+        // GcPending parts may not be referenced (race interlock).
+        let now = OffsetDateTime::now_utc();
+        for part_ref in &manifest.parts {
+            inc_part_refcount(&mut parts, &part_ref.hash, part_ref.size, now)?;
+        }
+
+        // Decrement old manifest's part refcounts; collect freed.
+        if let Some(old) = old {
+            for old_part in &old.parts {
+                if let Some(hash) = dec_part_refcount(&mut parts, &old_part.hash)? {
+                    freed.push(hash);
+                }
+            }
+        }
+
+        let bytes = bincode_encode(manifest)?;
+        objects.insert(key_bytes.as_slice(), bytes.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(DeletionEffect { freed_parts: freed })
+}
+
+fn handle_get_manifest(db: &Database, key: &ManifestKey) -> Result<Option<Manifest>, MetaError> {
+    let tx = db.begin_read()?;
+    let table = tx.open_table(OBJECTS)?;
+    let key_bytes = key.encode();
+    let Some(v) = table.get(key_bytes.as_slice())? else {
+        return Ok(None);
+    };
+    let m: Manifest = bincode_decode(v.value())?;
+    Ok(Some(m))
+}
+
+fn handle_delete_manifest(db: &Database, key: &ManifestKey) -> Result<DeletionEffect, MetaError> {
+    let tx = db.begin_write()?;
+    let mut freed = Vec::new();
+    {
+        let mut objects = tx.open_table(OBJECTS)?;
+        let mut parts = tx.open_table(PARTS)?;
+
+        let key_bytes = key.encode();
+        let m: Manifest = {
+            let Some(v) = objects.get(key_bytes.as_slice())? else {
+                return Err(MetaError::ManifestNotFound(key.clone()));
+            };
+            bincode_decode(v.value())?
+        };
+
+        for p in &m.parts {
+            if let Some(hash) = dec_part_refcount(&mut parts, &p.hash)? {
+                freed.push(hash);
+            }
+        }
+        objects.remove(key_bytes.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(DeletionEffect { freed_parts: freed })
+}
+
+fn handle_update_state(
+    db: &Database,
+    key: &ManifestKey,
+    new_state: ManifestState,
+) -> Result<(), MetaError> {
+    let tx = db.begin_write()?;
+    {
+        let mut objects = tx.open_table(OBJECTS)?;
+        let key_bytes = key.encode();
+        let mut m: Manifest = {
+            let Some(v) = objects.get(key_bytes.as_slice())? else {
+                return Err(MetaError::ManifestNotFound(key.clone()));
+            };
+            bincode_decode(v.value())?
+        };
+        m.state = new_state;
+        m.last_modified = OffsetDateTime::now_utc();
+        let bytes = bincode_encode(&m)?;
+        objects.insert(key_bytes.as_slice(), bytes.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn handle_append_part(
+    db: &Database,
+    key: &ManifestKey,
+    part: &PartRef,
+) -> Result<DeletionEffect, MetaError> {
+    let tx = db.begin_write()?;
+    let mut freed = Vec::new();
+    {
+        let mut objects = tx.open_table(OBJECTS)?;
+        let mut parts = tx.open_table(PARTS)?;
+
+        let key_bytes = key.encode();
+        let mut m: Manifest = {
+            let Some(v) = objects.get(key_bytes.as_slice())? else {
+                return Err(MetaError::ManifestNotFound(key.clone()));
+            };
+            bincode_decode(v.value())?
+        };
+
+        // If replacing existing part_number, decrement old refcount
+        if let Some(old_idx) = m.parts.iter().position(|p| p.part_number == part.part_number) {
+            let old_hash = m.parts[old_idx].hash;
+            if old_hash != part.hash {
+                if let Some(hash) = dec_part_refcount(&mut parts, &old_hash)? {
+                    freed.push(hash);
+                }
+            } else {
+                // Same hash, same number: net zero — decrement now, will re-increment below
+                let _ = dec_part_refcount(&mut parts, &old_hash)?;
+            }
+            m.parts.remove(old_idx);
+        }
+
+        // Increment new part refcount
+        let now = OffsetDateTime::now_utc();
+        inc_part_refcount(&mut parts, &part.hash, part.size, now)?;
+
+        // Append + sort
+        m.parts.push(part.clone());
+        m.parts.sort_by_key(|p| p.part_number);
+        m.size = m.parts.iter().map(|p| p.size).sum();
+        m.last_modified = OffsetDateTime::now_utc();
+
+        let bytes = bincode_encode(&m)?;
+        objects.insert(key_bytes.as_slice(), bytes.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(DeletionEffect { freed_parts: freed })
+}
+
+fn handle_get_part(db: &Database, hash: &Hash) -> Result<Option<PartEntry>, MetaError> {
+    let tx = db.begin_read()?;
+    let table = tx.open_table(PARTS)?;
+    let Some(v) = table.get(hash)? else { return Ok(None) };
+    let e: PartEntry = bincode_decode(v.value())?;
+    Ok(Some(e))
+}
+
+fn handle_mark_gc_pending(db: &Database, hash: &Hash) -> Result<bool, MetaError> {
+    let tx = db.begin_write()?;
+    let marked;
+    {
+        let mut parts = tx.open_table(PARTS)?;
+        let mut e: PartEntry = {
+            let Some(v) = parts.get(hash)? else {
+                return Err(MetaError::PartNotFound(hex::encode(hash)));
+            };
+            bincode_decode(v.value())?
+        };
+        if e.refcount != 0 {
+            marked = false;
+        } else {
+            e.state = PartState::GcPending;
+            let bytes = bincode_encode(&e)?;
+            parts.insert(hash, bytes.as_slice())?;
+            marked = true;
+        }
+    }
+    tx.commit()?;
+    Ok(marked)
+}
+
+fn handle_remove_part(db: &Database, hash: &Hash) -> Result<(), MetaError> {
+    let tx = db.begin_write()?;
+    {
+        let mut parts = tx.open_table(PARTS)?;
+        parts.remove(hash)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn handle_list_gc_pending(db: &Database) -> Result<Vec<Hash>, MetaError> {
+    let tx = db.begin_read()?;
+    let parts = tx.open_table(PARTS)?;
+    let mut result = Vec::new();
+    for entry in parts.iter()? {
+        let (k, v) = entry?;
+        let e: PartEntry = bincode_decode(v.value())?;
+        if e.state == PartState::GcPending {
+            result.push(*k.value());
+        }
+    }
+    Ok(result)
+}
+
+// ---- helpers ----
+
+fn inc_part_refcount(
+    parts: &mut redb::Table<'_, &'static [u8; 32], &'static [u8]>,
+    hash: &Hash,
+    size: u64,
+    now: OffsetDateTime,
+) -> Result<(), MetaError> {
+    let existing: Option<PartEntry> = {
+        if let Some(v) = parts.get(hash)? {
+            Some(bincode_decode(v.value())?)
+        } else {
+            None
+        }
+    };
+    let entry = match existing {
+        Some(mut e) => {
+            if e.state == PartState::GcPending {
+                return Err(MetaError::PartGcPending(hex::encode(hash)));
+            }
+            e.refcount = e.refcount.saturating_add(1);
+            e
+        }
+        None => PartEntry {
+            refcount: 1,
+            size,
+            state: PartState::Live,
+            created_at: now,
+        },
+    };
+    let bytes = bincode_encode(&entry)?;
+    parts.insert(hash, bytes.as_slice())?;
+    Ok(())
+}
+
+/// Returns Some(hash) if refcount dropped to 0 (caller should mark+GC).
+fn dec_part_refcount(
+    parts: &mut redb::Table<'_, &'static [u8; 32], &'static [u8]>,
+    hash: &Hash,
+) -> Result<Option<Hash>, MetaError> {
+    let mut e: PartEntry = {
+        let Some(v) = parts.get(hash)? else {
+            return Ok(None);
+        };
+        bincode_decode(v.value())?
+    };
+    if e.refcount > 0 {
+        e.refcount -= 1;
+    }
+    let freed = if e.refcount == 0 { Some(*hash) } else { None };
+    let bytes = bincode_encode(&e)?;
+    parts.insert(hash, bytes.as_slice())?;
+    Ok(freed)
+}
+
+fn bincode_encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, MetaError> {
+    bincode::serde::encode_to_vec(v, bincode::config::standard())
+        .map_err(|e| MetaError::BincodeEncode(e.to_string()))
+}
+
+fn bincode_decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, MetaError> {
+    let (v, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+        .map_err(|e| MetaError::BincodeDecode(e.to_string()))?;
+    Ok(v)
+}
+
+// Silence unused-import warning until later phases wire up SERVER_META / EVENTS_DLQ.
+#[allow(dead_code)]
+fn _ensure_tables_referenced() {
+    let _ = &SERVER_META;
+    let _ = &EVENTS_DLQ;
+}
