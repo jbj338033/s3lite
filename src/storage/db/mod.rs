@@ -184,6 +184,22 @@ impl MetaStore {
         self.dispatch(|reply| actor::Op::ListObjects { request, reply })
             .await?
     }
+
+    /// Atomically transition an in-progress multipart manifest into a
+    /// committed object: drops the in-progress row, inserts the committed
+    /// manifest, adjusts part refcounts, and reports freed parts.
+    pub async fn complete_multipart_upload(
+        &self,
+        in_progress_key: ManifestKey,
+        new_committed: Manifest,
+    ) -> Result<DeletionEffect, MetaError> {
+        self.dispatch(|reply| actor::Op::CompleteMultipartUpload {
+            in_progress_key,
+            new_committed,
+            reply,
+        })
+        .await?
+    }
 }
 
 impl Drop for MetaStore {

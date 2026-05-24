@@ -75,6 +75,11 @@ pub(super) enum Op {
         request: ListObjectsRequest,
         reply: Reply<Result<ListObjectsPage, MetaError>>,
     },
+    CompleteMultipartUpload {
+        in_progress_key: ManifestKey,
+        new_committed: Manifest,
+        reply: Reply<Result<DeletionEffect, MetaError>>,
+    },
 
     Shutdown,
 }
@@ -141,6 +146,17 @@ pub(super) fn run(
             }
             Op::ListObjects { request, reply } => {
                 let _ = reply.send(handle_list_objects(&db, &request));
+            }
+            Op::CompleteMultipartUpload {
+                in_progress_key,
+                new_committed,
+                reply,
+            } => {
+                let _ = reply.send(handle_complete_multipart(
+                    &db,
+                    &in_progress_key,
+                    &new_committed,
+                ));
             }
         }
     }
@@ -526,6 +542,100 @@ fn after_prefix(bucket: &str, prefix: &str) -> Vec<u8> {
     v.extend_from_slice(bytes);
     v.push(1);
     v
+}
+
+/// Atomic transition: in-progress multipart manifest → committed object.
+/// All three steps (in-progress part decrement, old-committed part decrement,
+/// new committed part increment, manifest row swap) happen in a single redb
+/// write tx so partial states never appear to the rest of the system.
+fn handle_complete_multipart(
+    db: &Database,
+    in_progress_key: &ManifestKey,
+    new_committed: &Manifest,
+) -> Result<DeletionEffect, MetaError> {
+    use std::collections::HashSet;
+
+    let tx = db.begin_write()?;
+    let mut freed: Vec<Hash> = Vec::new();
+    {
+        let mut objects = tx.open_table(OBJECTS)?;
+        let mut parts = tx.open_table(PARTS)?;
+
+        let in_progress_key_bytes = in_progress_key.encode();
+        let committed_key_bytes = new_committed.key.encode();
+
+        let in_progress: Manifest = {
+            let Some(v) = objects.get(in_progress_key_bytes.as_slice())? else {
+                return Err(MetaError::ManifestNotFound(in_progress_key.clone()));
+            };
+            bincode_decode(v.value())?
+        };
+        if !matches!(in_progress.state, ManifestState::InProgress) {
+            return Err(MetaError::UploadNotInProgress(in_progress_key.clone()));
+        }
+
+        let old_committed: Option<Manifest> = {
+            if let Some(v) = objects.get(committed_key_bytes.as_slice())? {
+                Some(bincode_decode(v.value())?)
+            } else {
+                None
+            }
+        };
+
+        // Refcount delta — decrement all parts referenced by the soon-to-be-
+        // gone manifests, then increment all parts referenced by the new one.
+        // Order matters only in that increment can resurrect a part that just
+        // hit refcount=0 (state=Live, not GcPending) — which inc_part_refcount
+        // accepts.
+        for p in &in_progress.parts {
+            let _ = dec_part_refcount(&mut parts, &p.hash)?;
+        }
+        if let Some(old) = &old_committed {
+            for p in &old.parts {
+                let _ = dec_part_refcount(&mut parts, &p.hash)?;
+            }
+        }
+        let now = OffsetDateTime::now_utc();
+        for p in &new_committed.parts {
+            inc_part_refcount(&mut parts, &p.hash, p.size, now)?;
+        }
+
+        // Collect parts that finished at refcount=0 (eligible for GC). Only
+        // parts NOT referenced by the new committed manifest can be free.
+        let new_hashes: HashSet<Hash> =
+            new_committed.parts.iter().map(|p| p.hash).collect();
+        let mut considered: HashSet<Hash> = HashSet::new();
+        let mut collect = |parts: &redb::Table<'_, &'static [u8; 32], &'static [u8]>,
+                           candidate: &Hash|
+         -> Result<(), MetaError> {
+            if !considered.insert(*candidate) || new_hashes.contains(candidate) {
+                return Ok(());
+            }
+            if let Some(v) = parts.get(candidate)? {
+                let entry: PartEntry = bincode_decode(v.value())?;
+                if entry.refcount == 0 {
+                    freed.push(*candidate);
+                }
+            }
+            Ok(())
+        };
+        for p in &in_progress.parts {
+            collect(&parts, &p.hash)?;
+        }
+        if let Some(old) = &old_committed {
+            for p in &old.parts {
+                collect(&parts, &p.hash)?;
+            }
+        }
+
+        objects.insert(
+            committed_key_bytes.as_slice(),
+            bincode_encode(new_committed)?.as_slice(),
+        )?;
+        objects.remove(in_progress_key_bytes.as_slice())?;
+    }
+    tx.commit()?;
+    Ok(DeletionEffect { freed_parts: freed })
 }
 
 fn handle_list_gc_pending(db: &Database) -> Result<Vec<Hash>, MetaError> {

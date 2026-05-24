@@ -26,6 +26,8 @@ pub enum MetaError {
     PartGcPending(String),
     #[error("part not found: {0}")]
     PartNotFound(String),
+    #[error("manifest exists but is not in in_progress state: {0:?}")]
+    UploadNotInProgress(ManifestKey),
 }
 
 impl From<redb::DatabaseError> for MetaError {
