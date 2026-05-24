@@ -17,8 +17,29 @@ hex = "0.4"
 thiserror = "2"
 tracing = "0.1"
 
+# HTTP layer
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+quick-xml = { version = "0.38", features = ["serialize"] }
+
+# Sigv4 server-side verification (uses chrono internally; bridge at the call site)
+scratchstack-aws-signature = "0.11"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Identifiers / random / constant-time
+base64 = "0.22"
+rand = "0.9"
+subtle = "2"
+
 [dev-dependencies]
 tempfile = "3"
+aws-sigv4 = "1"
+aws-credential-types = "1"
+aws-smithy-runtime-api = "1"
 
 [profile.release]
 lto = "thin"
