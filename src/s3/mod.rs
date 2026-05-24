@@ -3,6 +3,7 @@ pub mod bucket;
 pub mod checksum;
 pub mod dispatch;
 pub mod listing;
+pub mod multipart;
 pub mod object;
 pub mod state;
 pub mod xml;

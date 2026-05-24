@@ -815,6 +815,315 @@ async fn list_v1_marker_pagination() {
     assert_eq!(keys2, vec!["c", "d"]);
 }
 
+// ---------------- Phase 6: multipart upload ----------------
+
+#[tokio::test]
+async fn multipart_full_round_trip() {
+    let h = start_server().await;
+    let bucket = "mpu-bucket";
+    let key = "big.bin";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+
+    let init = h
+        .client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("create_multipart_upload");
+    let upload_id = init.upload_id().unwrap().to_string();
+
+    let part1 = vec![b'a'; 5 * 1024 * 1024]; // 5 MiB
+    let part2 = vec![b'b'; 1024];
+    let up1 = h
+        .client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(part1.clone()))
+        .send()
+        .await
+        .expect("upload_part 1");
+    let up2 = h
+        .client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(2)
+        .body(ByteStream::from(part2.clone()))
+        .send()
+        .await
+        .expect("upload_part 2");
+
+    let completed_parts = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+        .parts(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(1)
+                .e_tag(up1.e_tag().unwrap())
+                .build(),
+        )
+        .parts(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(2)
+                .e_tag(up2.e_tag().unwrap())
+                .build(),
+        )
+        .build();
+    let completed = h
+        .client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(completed_parts)
+        .send()
+        .await
+        .expect("complete_multipart_upload");
+
+    // Final ETag must follow the multipart "md5(of-concat-md5s)-N" form.
+    let final_etag = completed.e_tag().unwrap();
+    assert!(
+        final_etag.ends_with("-2\""),
+        "expected multipart ETag with -2 suffix, got {final_etag}"
+    );
+
+    // GetObject returns concatenated bytes.
+    let got = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let content_length = got.content_length();
+    let returned_etag = got.e_tag().map(String::from);
+    let body = got.body.collect().await.unwrap().into_bytes();
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    assert_eq!(body.as_ref(), expected.as_slice());
+    assert_eq!(content_length, Some(expected.len() as i64));
+    assert_eq!(returned_etag.unwrap(), final_etag);
+}
+
+#[tokio::test]
+async fn multipart_abort_releases_parts() {
+    let h = start_server().await;
+    let bucket = "mpu-abort";
+    let key = "k";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+
+    let init = h
+        .client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let upload_id = init.upload_id().unwrap().to_string();
+
+    h.client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(b"abc".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    h.client
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .expect("abort_multipart_upload");
+
+    // Subsequent Complete on the same upload_id should fail (no such upload).
+    let bogus_parts = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+        .parts(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(1)
+                .e_tag("\"deadbeef\"")
+                .build(),
+        )
+        .build();
+    let err = h
+        .client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(bogus_parts)
+        .send()
+        .await
+        .expect_err("complete should fail after abort");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("NoSuchUpload"), "expected NoSuchUpload, got {msg}");
+}
+
+#[tokio::test]
+async fn multipart_complete_with_wrong_etag_rejected() {
+    let h = start_server().await;
+    let bucket = "mpu-etag";
+    let key = "k";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+
+    let init = h
+        .client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let upload_id = init.upload_id().unwrap().to_string();
+
+    h.client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(b"hello".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    let completed_parts = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+        .parts(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(1)
+                .e_tag("\"badbadbadbadbadbadbadbadbadbadba\"")
+                .build(),
+        )
+        .build();
+    let err = h
+        .client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(completed_parts)
+        .send()
+        .await
+        .expect_err("complete with wrong etag should fail");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("InvalidArgument"), "expected InvalidArgument, got {msg}");
+}
+
+#[tokio::test]
+async fn multipart_list_parts_shows_uploaded_parts() {
+    let h = start_server().await;
+    let bucket = "mpu-list";
+    let key = "k";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+
+    let init = h
+        .client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let upload_id = init.upload_id().unwrap().to_string();
+    for n in 1..=3 {
+        h.client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(n)
+            .body(ByteStream::from(vec![n as u8; 10]))
+            .send()
+            .await
+            .unwrap();
+    }
+    let parts = h
+        .client
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .expect("list_parts");
+    let nums: Vec<i32> = parts.parts().iter().filter_map(|p| p.part_number()).collect();
+    assert_eq!(nums, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn multipart_replaces_existing_committed_object() {
+    let h = start_server().await;
+    let bucket = "mpu-replace";
+    let key = "obj";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+
+    // First, write a single-part object.
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(b"version-one".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    // Now upload a multipart object to the same key.
+    let init = h
+        .client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let upload_id = init.upload_id().unwrap().to_string();
+    let p1 = vec![b'x'; 8];
+    let up = h
+        .client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(p1.clone()))
+        .send()
+        .await
+        .unwrap();
+    h.client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .parts(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(up.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let got = h.client.get_object().bucket(bucket).key(key).send().await.unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), p1.as_slice());
+}
+
 #[tokio::test]
 async fn list_v2_etag_and_size_in_contents() {
     let h = start_server().await;

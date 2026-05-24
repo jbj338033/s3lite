@@ -8,7 +8,7 @@ use crate::http::request_context::RequestId;
 
 use super::addressing::{Addressing, extract};
 use super::state::AppState;
-use super::{bucket, listing, object};
+use super::{bucket, listing, multipart, object};
 
 /// Single entry point for every S3-shaped request. Dispatches by
 /// (method, addressing, query) to the appropriate bucket/object handler.
@@ -62,6 +62,9 @@ async fn handle(
     headers: &axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> Result<Response, S3Error> {
+    let upload_id = query_value(query, "uploadId");
+    let part_number = query_value(query, "partNumber");
+
     match (method, addressing.bucket, addressing.key) {
         (Method::GET, None, _) => bucket::list_buckets(state).await,
 
@@ -73,6 +76,44 @@ async fn handle(
             bucket::get_bucket_location(state, &b).await
         }
         (Method::GET, Some(b), None) => listing::list_objects(state, &b, query).await,
+
+        // Multipart upload
+        (Method::POST, Some(b), Some(k)) if has_query_flag(query, "uploads") => {
+            multipart::create_multipart_upload(state, &b, &k, headers).await
+        }
+        (Method::POST, Some(b), Some(k)) if upload_id.is_some() => {
+            multipart::complete_multipart_upload(
+                state,
+                &b,
+                &k,
+                upload_id.as_deref().unwrap(),
+                body,
+            )
+            .await
+        }
+        (Method::PUT, Some(b), Some(k))
+            if upload_id.is_some() && part_number.is_some() =>
+        {
+            let pn: u32 = part_number.as_deref().unwrap().parse().map_err(|_| {
+                S3Error::new(S3ErrorCode::InvalidArgument, "partNumber must be a number")
+            })?;
+            multipart::upload_part(
+                state,
+                &b,
+                &k,
+                upload_id.as_deref().unwrap(),
+                pn,
+                headers,
+                body,
+            )
+            .await
+        }
+        (Method::DELETE, Some(b), Some(k)) if upload_id.is_some() => {
+            multipart::abort_multipart_upload(state, &b, &k, upload_id.as_deref().unwrap()).await
+        }
+        (Method::GET, Some(b), Some(k)) if upload_id.is_some() => {
+            multipart::list_parts(state, &b, &k, upload_id.as_deref().unwrap()).await
+        }
 
         // Object-level
         (Method::PUT, Some(b), Some(k)) => object::put_object(state, &b, &k, headers, body).await,
@@ -92,6 +133,51 @@ async fn handle(
             "operation not implemented",
         )
         .with_resource(String::new())),
+    }
+}
+
+fn query_value(query: &str, key: &str) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
+    for pair in query.split('&') {
+        let (name, value) = match pair.split_once('=') {
+            Some((n, v)) => (n, v),
+            None => (pair, ""),
+        };
+        if name == key {
+            return Some(percent_decode(value));
+        }
+    }
+    None
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_nib(bytes[i + 1]);
+            let lo = hex_nib(bytes[i + 2]);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nib(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
