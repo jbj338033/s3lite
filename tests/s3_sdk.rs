@@ -578,3 +578,263 @@ async fn put_if_match_with_correct_etag_replaces() {
     let body = got.body.collect().await.unwrap().into_bytes();
     assert_eq!(body.as_ref(), b"v2");
 }
+
+// ---------------- Phase 5: ListObjects ----------------
+
+async fn seed_objects(h: &Harness, bucket: &str, keys: &[&str]) {
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    for k in keys {
+        h.client
+            .put_object()
+            .bucket(bucket)
+            .key(*k)
+            .body(ByteStream::from(format!("body-{k}").into_bytes()))
+            .send()
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn list_v2_returns_all_objects_lexicographic_order() {
+    let h = start_server().await;
+    let bucket = "list-basic";
+    seed_objects(&h, bucket, &["b.txt", "a.txt", "c.txt"]).await;
+
+    let resp = h
+        .client
+        .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap();
+
+    let keys: Vec<&str> = resp.contents().iter().filter_map(|c| c.key()).collect();
+    assert_eq!(keys, vec!["a.txt", "b.txt", "c.txt"]);
+    assert_eq!(resp.key_count(), Some(3));
+    assert_eq!(resp.is_truncated(), Some(false));
+}
+
+#[tokio::test]
+async fn list_v2_prefix_filter() {
+    let h = start_server().await;
+    let bucket = "list-prefix";
+    seed_objects(
+        &h,
+        bucket,
+        &["photos/a.jpg", "photos/b.jpg", "docs/r.pdf", "z.bin"],
+    )
+    .await;
+
+    let resp = h
+        .client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix("photos/")
+        .send()
+        .await
+        .unwrap();
+    let keys: Vec<&str> = resp.contents().iter().filter_map(|c| c.key()).collect();
+    assert_eq!(keys, vec!["photos/a.jpg", "photos/b.jpg"]);
+}
+
+#[tokio::test]
+async fn list_v2_delimiter_produces_common_prefixes() {
+    let h = start_server().await;
+    let bucket = "list-delim";
+    seed_objects(
+        &h,
+        bucket,
+        &[
+            "photos/2024/jan/01.jpg",
+            "photos/2024/jan/02.jpg",
+            "photos/2024/feb/01.jpg",
+            "photos/2023/dec/31.jpg",
+            "videos/v.mp4",
+            "root.txt",
+        ],
+    )
+    .await;
+
+    let resp = h
+        .client
+        .list_objects_v2()
+        .bucket(bucket)
+        .delimiter("/")
+        .send()
+        .await
+        .unwrap();
+    let prefixes: Vec<&str> = resp
+        .common_prefixes()
+        .iter()
+        .filter_map(|p| p.prefix())
+        .collect();
+    let keys: Vec<&str> = resp.contents().iter().filter_map(|c| c.key()).collect();
+    assert_eq!(prefixes, vec!["photos/", "videos/"]);
+    assert_eq!(keys, vec!["root.txt"]);
+}
+
+#[tokio::test]
+async fn list_v2_prefix_with_delimiter_lists_subdirs() {
+    let h = start_server().await;
+    let bucket = "list-subdir";
+    seed_objects(
+        &h,
+        bucket,
+        &[
+            "photos/2023/dec/31.jpg",
+            "photos/2024/feb/01.jpg",
+            "photos/2024/jan/01.jpg",
+            "photos/index.html",
+        ],
+    )
+    .await;
+
+    let resp = h
+        .client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix("photos/")
+        .delimiter("/")
+        .send()
+        .await
+        .unwrap();
+    let prefixes: Vec<&str> = resp
+        .common_prefixes()
+        .iter()
+        .filter_map(|p| p.prefix())
+        .collect();
+    let keys: Vec<&str> = resp.contents().iter().filter_map(|c| c.key()).collect();
+    assert_eq!(prefixes, vec!["photos/2023/", "photos/2024/"]);
+    assert_eq!(keys, vec!["photos/index.html"]);
+}
+
+#[tokio::test]
+async fn list_v2_pagination_via_continuation_token() {
+    let h = start_server().await;
+    let bucket = "list-page";
+    let all: Vec<String> = (0..5).map(|i| format!("k{i:02}")).collect();
+    let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+    seed_objects(&h, bucket, &refs).await;
+
+    let mut collected: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut req = h
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .max_keys(2);
+        if let Some(t) = &token {
+            req = req.continuation_token(t.clone());
+        }
+        let resp = req.send().await.unwrap();
+        for c in resp.contents() {
+            collected.push(c.key().unwrap().to_string());
+        }
+        if resp.is_truncated() != Some(true) {
+            break;
+        }
+        token = resp.next_continuation_token().map(String::from);
+        assert!(token.is_some(), "truncated response must include next-token");
+    }
+    assert_eq!(collected, all);
+}
+
+#[tokio::test]
+async fn list_v2_start_after_skips_to_resume_point() {
+    let h = start_server().await;
+    let bucket = "list-start-after";
+    seed_objects(&h, bucket, &["a", "b", "c", "d", "e"]).await;
+
+    let resp = h
+        .client
+        .list_objects_v2()
+        .bucket(bucket)
+        .start_after("b")
+        .send()
+        .await
+        .unwrap();
+    let keys: Vec<&str> = resp.contents().iter().filter_map(|c| c.key()).collect();
+    assert_eq!(keys, vec!["c", "d", "e"]);
+}
+
+#[tokio::test]
+async fn list_v2_encoding_type_url_encodes_keys_and_prefixes() {
+    let h = start_server().await;
+    let bucket = "list-enc";
+    seed_objects(&h, bucket, &["pictures/cat dog.jpg"]).await;
+
+    let resp = h
+        .client
+        .list_objects_v2()
+        .bucket(bucket)
+        .delimiter("/")
+        .encoding_type(aws_sdk_s3::types::EncodingType::Url)
+        .send()
+        .await
+        .unwrap();
+    // The SDK passes through encoded values; "/" becomes "%2F".
+    let prefixes: Vec<&str> = resp
+        .common_prefixes()
+        .iter()
+        .filter_map(|p| p.prefix())
+        .collect();
+    assert_eq!(prefixes, vec!["pictures%2F"]);
+    assert_eq!(resp.encoding_type(), Some(&aws_sdk_s3::types::EncodingType::Url));
+}
+
+#[tokio::test]
+async fn list_v1_marker_pagination() {
+    let h = start_server().await;
+    let bucket = "list-v1";
+    seed_objects(&h, bucket, &["a", "b", "c", "d"]).await;
+
+    let first = h
+        .client
+        .list_objects()
+        .bucket(bucket)
+        .max_keys(2)
+        .send()
+        .await
+        .unwrap();
+    let keys: Vec<&str> = first.contents().iter().filter_map(|c| c.key()).collect();
+    assert_eq!(keys, vec!["a", "b"]);
+    assert_eq!(first.is_truncated(), Some(true));
+
+    let second = h
+        .client
+        .list_objects()
+        .bucket(bucket)
+        .marker("b")
+        .max_keys(2)
+        .send()
+        .await
+        .unwrap();
+    let keys2: Vec<&str> = second.contents().iter().filter_map(|c| c.key()).collect();
+    assert_eq!(keys2, vec!["c", "d"]);
+}
+
+#[tokio::test]
+async fn list_v2_etag_and_size_in_contents() {
+    let h = start_server().await;
+    let bucket = "list-meta";
+    seed_objects(&h, bucket, &["hello"]).await;
+
+    let resp = h
+        .client
+        .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap();
+    let entry = resp.contents().first().unwrap();
+    assert_eq!(entry.key(), Some("hello"));
+    assert!(entry.e_tag().is_some());
+    // "body-hello" is 10 bytes
+    assert_eq!(entry.size(), Some(10));
+    assert_eq!(
+        entry.storage_class(),
+        Some(&aws_sdk_s3::types::ObjectStorageClass::Standard)
+    );
+}

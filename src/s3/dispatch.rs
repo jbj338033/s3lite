@@ -8,7 +8,7 @@ use crate::http::request_context::RequestId;
 
 use super::addressing::{Addressing, extract};
 use super::state::AppState;
-use super::{bucket, object};
+use super::{bucket, listing, object};
 
 /// Single entry point for every S3-shaped request. Dispatches by
 /// (method, addressing, query) to the appropriate bucket/object handler.
@@ -72,13 +72,7 @@ async fn handle(
         (Method::GET, Some(b), None) if has_query_flag(query, "location") => {
             bucket::get_bucket_location(state, &b).await
         }
-        (Method::GET, Some(_b), None) => {
-            // ListObjects(V2) — Phase 5
-            Err(S3Error::new(
-                S3ErrorCode::NotImplemented,
-                "ListObjects arrives in Phase 5",
-            ))
-        }
+        (Method::GET, Some(b), None) => listing::list_objects(state, &b, query).await,
 
         // Object-level
         (Method::PUT, Some(b), Some(k)) => object::put_object(state, &b, &k, headers, body).await,
