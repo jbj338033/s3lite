@@ -28,6 +28,7 @@ pub async fn put_object(
     body: Bytes,
 ) -> Result<Response, S3Error> {
     require_bucket(&state, bucket).await?;
+    check_put_preconditions(&state, bucket, key, headers).await?;
 
     // Legacy Content-MD5 verification (S3 returns BadDigest on mismatch).
     if let Some(expected) = parse_content_md5(headers)? {
@@ -377,6 +378,67 @@ fn parse_range_header(
     Ok(Some((start, end)))
 }
 
+/// Match an `If-Match` / `If-None-Match` header value (single ETag, `*`, or
+/// comma-separated list) against an object's current ETag.
+fn etag_matches(raw: &str, etag: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed == "*" || trimmed.split(',').any(|p| p.trim() == etag)
+}
+
+/// Pre-check conditional headers on PUT.
+///
+/// `If-Match` — replace only when the current object's ETag matches (or `*`
+/// means "any existing"); missing/mismatch → 412.
+/// `If-None-Match` — create only when no current object matches; existing or
+/// `*` with existing → 412.
+async fn check_put_preconditions(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+) -> Result<(), S3Error> {
+    let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
+    let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
+    if if_match.is_none() && if_none_match.is_none() {
+        return Ok(());
+    }
+
+    let existing = state
+        .meta
+        .get_manifest(ManifestKey::new(bucket, key, NULL_VERSION_ID))
+        .await
+        .map_err(map_meta_err)?
+        .filter(|m| {
+            matches!(m.state, ManifestState::Committed) && matches!(m.kind, ManifestKind::Object)
+        });
+
+    let resource = format!("/{bucket}/{key}");
+
+    if let Some(im) = if_match {
+        let pass = existing
+            .as_ref()
+            .is_some_and(|m| etag_matches(im, &m.etag()));
+        if !pass {
+            return Err(
+                S3Error::new(S3ErrorCode::PreconditionFailed, "If-Match failed")
+                    .with_resource(resource),
+            );
+        }
+    }
+    if let Some(inm) = if_none_match {
+        let blocks = existing
+            .as_ref()
+            .is_some_and(|m| etag_matches(inm, &m.etag()));
+        if blocks {
+            return Err(
+                S3Error::new(S3ErrorCode::PreconditionFailed, "If-None-Match failed")
+                    .with_resource(resource),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Returns Some(response) for short-circuit precondition results (304 / 412).
 fn evaluate_preconditions(
     headers: &HeaderMap,
@@ -396,10 +458,8 @@ fn evaluate_preconditions(
         .and_then(|v| v.to_str().ok())
         .and_then(parse_http_date);
 
-    let matches_etag = |raw: &str| raw == "*" || raw.split(',').any(|p| p.trim() == etag);
-
     if let Some(im) = if_match
-        && !matches_etag(im)
+        && !etag_matches(im, etag)
     {
         return Some(
             S3Error::new(S3ErrorCode::PreconditionFailed, "If-Match failed")
@@ -408,7 +468,7 @@ fn evaluate_preconditions(
         );
     }
     if let Some(inm) = if_none_match
-        && matches_etag(inm)
+        && etag_matches(inm, etag)
     {
         // 304 Not Modified
         return Some(StatusCode::NOT_MODIFIED.into_response());

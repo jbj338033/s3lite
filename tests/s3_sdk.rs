@@ -449,3 +449,132 @@ async fn put_with_sha1_checksum_succeeds() {
         .expect("put_object with sha1 checksum");
 }
 
+// ---------------- Phase 4: conditional PUT ----------------
+
+#[tokio::test]
+async fn put_if_none_match_star_blocks_overwrite() {
+    let h = start_server().await;
+    let bucket = "cond-put";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"first".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    let err = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .if_none_match("*")
+        .body(ByteStream::from(b"second".to_vec()))
+        .send()
+        .await
+        .expect_err("If-None-Match: * should block overwrite");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("PreconditionFailed") || msg.contains("412"),
+        "expected PreconditionFailed, got {msg}"
+    );
+
+    // original content unchanged
+    let got = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("k")
+        .send()
+        .await
+        .unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"first");
+}
+
+#[tokio::test]
+async fn put_if_none_match_star_allows_create() {
+    let h = start_server().await;
+    let bucket = "cond-create";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("new-key")
+        .if_none_match("*")
+        .body(ByteStream::from(b"created".to_vec()))
+        .send()
+        .await
+        .expect("If-None-Match: * should allow create when absent");
+}
+
+#[tokio::test]
+async fn put_if_match_with_wrong_etag_returns_412() {
+    let h = start_server().await;
+    let bucket = "cond-cas";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"v1".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    let err = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .if_match("\"deadbeef\"")
+        .body(ByteStream::from(b"v2".to_vec()))
+        .send()
+        .await
+        .expect_err("If-Match with wrong ETag should fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("PreconditionFailed") || msg.contains("412"),
+        "expected PreconditionFailed, got {msg}"
+    );
+}
+
+#[tokio::test]
+async fn put_if_match_with_correct_etag_replaces() {
+    let h = start_server().await;
+    let bucket = "cond-cas-ok";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    let put1 = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"v1".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let etag = put1.e_tag().unwrap().to_string();
+
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .if_match(etag)
+        .body(ByteStream::from(b"v2".to_vec()))
+        .send()
+        .await
+        .expect("If-Match with correct ETag should replace");
+
+    let got = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("k")
+        .send()
+        .await
+        .unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"v2");
+}
