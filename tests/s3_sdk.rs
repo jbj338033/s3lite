@@ -2562,3 +2562,192 @@ async fn sweep_gc_idempotent_after_inline_gc() {
     assert_eq!(first, 0, "inline GC already cleaned this part");
     assert_eq!(second, 0);
 }
+
+// ---------------- Phase 12: webhook event notifications ----------------
+
+use std::sync::Mutex;
+use s3lite::config::{EventType, WebhookSubscription};
+use s3lite::s3::events::decode_dlq_entry;
+
+/// Start a tiny HTTP server that records every received body. Used as the
+/// destination of webhook events under test.
+async fn spawn_webhook_sink() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+    use axum::routing::post;
+    use axum::Router;
+    use tokio::net::TcpListener;
+
+    let received: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let received_clone = received.clone();
+    let app = Router::new().route(
+        "/sink",
+        post(move |body: String| {
+            let received = received_clone.clone();
+            async move {
+                received.lock().unwrap().push(body);
+                axum::http::StatusCode::OK
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/sink"), received)
+}
+
+async fn start_server_with_webhooks(subs: Vec<WebhookSubscription>) -> Harness {
+    let dir = TempDir::new().unwrap();
+    let meta = Arc::new(MetaStore::open(dir.path().join("meta.redb")).await.unwrap());
+    let parts = Arc::new(PartStore::open(dir.path()).await.unwrap());
+    let mut config = (*s3lite::config::ServerConfig::new(
+        REGION,
+        AK,
+        SK,
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+    ))
+    .clone();
+    config.webhook_subscriptions = subs;
+    config.allow_loopback_webhooks = true;
+    let config = std::sync::Arc::new(config);
+    let state = AppState::new(meta, parts, config);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = build_app(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let endpoint = format!("http://{addr}");
+    let creds = aws_sdk_s3::config::Credentials::new(AK, SK, None, None, "test");
+    let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(REGION))
+        .credentials_provider(creds)
+        .endpoint_url(endpoint.clone())
+        .load()
+        .await;
+    let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+        .force_path_style(true)
+        .build();
+    let client = Client::from_conf(s3_config);
+    Harness {
+        _dir: dir,
+        _server: server,
+        client,
+        endpoint,
+        state,
+    }
+}
+
+#[tokio::test]
+async fn webhook_delivered_on_put_object() {
+    let (sink_url, received) = spawn_webhook_sink().await;
+    let h = start_server_with_webhooks(vec![WebhookSubscription {
+        bucket: "wh-bk".to_string(),
+        events: vec![EventType::ObjectCreatedPut],
+        prefix: None,
+        suffix: None,
+        url: sink_url,
+    }])
+    .await;
+    h.client.create_bucket().bucket("wh-bk").send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket("wh-bk")
+        .key("k")
+        .body(ByteStream::from(b"payload".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    // Webhook is fire-and-forget; give it a moment.
+    for _ in 0..20 {
+        if !received.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let bodies = received.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "expected exactly one webhook delivery");
+    let body = &bodies[0];
+    assert!(body.contains("s3:ObjectCreated:Put"), "body: {body}");
+    assert!(body.contains("\"name\":\"wh-bk\""), "body: {body}");
+    assert!(body.contains("\"key\":\"k\""), "body: {body}");
+    assert!(body.contains("\"size\":7"), "body: {body}");
+}
+
+#[tokio::test]
+async fn webhook_prefix_filter_excludes_nonmatching() {
+    let (sink_url, received) = spawn_webhook_sink().await;
+    let h = start_server_with_webhooks(vec![WebhookSubscription {
+        bucket: "wh-pf".to_string(),
+        events: vec![],
+        prefix: Some("photos/".to_string()),
+        suffix: None,
+        url: sink_url,
+    }])
+    .await;
+    h.client.create_bucket().bucket("wh-pf").send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket("wh-pf")
+        .key("docs/a.pdf")
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    h.client
+        .put_object()
+        .bucket("wh-pf")
+        .key("photos/a.jpg")
+        .body(ByteStream::from(b"y".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    for _ in 0..20 {
+        if !received.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let bodies = received.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "only the matching key should fire");
+    assert!(bodies[0].contains("\"key\":\"photos/a.jpg\""), "{:?}", bodies);
+}
+
+#[tokio::test]
+async fn webhook_to_link_local_blocked_and_dlq_recorded() {
+    let h = start_server_with_webhooks(vec![WebhookSubscription {
+        bucket: "wh-ssrf".to_string(),
+        events: vec![EventType::ObjectCreatedPut],
+        prefix: None,
+        suffix: None,
+        // Disable loopback again for this test by overriding via a manual config — but
+        // since our helper turns loopback on, use a clearly-private address that's
+        // still blocked even with loopback allowed.
+        url: "http://169.254.169.254/latest/meta-data/".to_string(),
+    }])
+    .await;
+    h.client.create_bucket().bucket("wh-ssrf").send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket("wh-ssrf")
+        .key("k")
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    // Wait for retries + DLQ insertion to settle.
+    for _ in 0..40 {
+        if !h.state.meta.list_dlq().await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let dlq = h.state.meta.list_dlq().await.unwrap();
+    assert!(!dlq.is_empty(), "expected DLQ entry for SSRF-blocked webhook");
+    let (_, bytes) = &dlq[0];
+    let record = decode_dlq_entry(bytes).expect("decode dlq");
+    assert!(record.url.contains("169.254"));
+    assert!(record.last_error.contains("SSRF"));
+}
