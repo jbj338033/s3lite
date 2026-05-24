@@ -2751,3 +2751,110 @@ async fn webhook_to_link_local_blocked_and_dlq_recorded() {
     assert!(record.url.contains("169.254"));
     assert!(record.last_error.contains("SSRF"));
 }
+
+// ---------------- Phase 13: presigned URLs ----------------
+
+#[tokio::test]
+async fn presigned_get_object_returns_body() {
+    let h = start_server().await;
+    let bucket = "presign-get";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"presigned-data".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    let cfg = aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(60))
+        .unwrap();
+    let req = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("k")
+        .presigned(cfg)
+        .await
+        .expect("presign get_object");
+
+    let url = req.uri().to_string();
+    let resp = reqwest::get(&url).await.expect("send presigned GET");
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "presigned GET failed with {status} body={body} url={url}"
+    );
+    assert_eq!(body.as_bytes(), b"presigned-data");
+}
+
+#[tokio::test]
+async fn presigned_put_object_creates_object() {
+    let h = start_server().await;
+    let bucket = "presign-put";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+
+    let cfg = aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(60))
+        .unwrap();
+    let req = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .presigned(cfg)
+        .await
+        .expect("presign put_object");
+    let url = req.uri().to_string();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .put(&url)
+        .body(b"via-presigned".to_vec())
+        .send()
+        .await
+        .expect("send presigned PUT");
+    assert!(resp.status().is_success(), "presigned PUT failed with {}", resp.status());
+
+    let got = h.client.get_object().bucket(bucket).key("k").send().await.unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"via-presigned");
+}
+
+#[tokio::test]
+async fn presigned_url_expires() {
+    let h = start_server().await;
+    let bucket = "presign-exp";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    let cfg = aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(1))
+        .unwrap();
+    let req = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("k")
+        .presigned(cfg)
+        .await
+        .unwrap();
+    let url = req.uri().to_string();
+
+    // Wait past the X-Amz-Expires window.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "expired presigned URL should be rejected"
+    );
+}
