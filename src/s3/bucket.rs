@@ -39,13 +39,36 @@ pub async fn list_buckets(state: AppState) -> Result<Response, S3Error> {
     Ok(XmlBody(body).into_response())
 }
 
-pub async fn create_bucket(state: AppState, bucket: &str) -> Result<Response, S3Error> {
+pub async fn create_bucket(
+    state: AppState,
+    bucket: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<Response, S3Error> {
+    let object_lock_enabled = headers
+        .get("x-amz-bucket-object-lock-enabled")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let object_lock = if object_lock_enabled {
+        Some(crate::storage::manifest::ObjectLockConfig {
+            enabled: true,
+            default_retention: None,
+        })
+    } else {
+        None
+    };
+    // S3 enabling object lock at creation also implicitly enables versioning.
+    let versioning = if object_lock_enabled {
+        crate::storage::manifest::VersioningState::Enabled
+    } else {
+        crate::storage::manifest::VersioningState::Off
+    };
     let cfg = BucketConfig {
         created_at: OffsetDateTime::now_utc(),
-        versioning: crate::storage::manifest::VersioningState::Off,
+        versioning,
         region: state.config.region.clone(),
         cors_rules: Vec::new(),
-        object_lock: None,
+        object_lock,
     };
     match state.meta.create_bucket(bucket, cfg).await {
         Ok(()) => {

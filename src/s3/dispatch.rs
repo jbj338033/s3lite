@@ -92,7 +92,7 @@ async fn handle(
         }
         (Method::OPTIONS, Some(b), _) => cors::preflight(state, &b, headers).await,
         // Bucket-level catch-alls
-        (Method::PUT, Some(b), None) => bucket::create_bucket(state, &b).await,
+        (Method::PUT, Some(b), None) => bucket::create_bucket(state, &b, headers).await,
         (Method::DELETE, Some(b), None) => bucket::delete_bucket(state, &b).await,
         (Method::HEAD, Some(b), None) => bucket::head_bucket(state, &b).await,
         (Method::GET, Some(b), None) => listing::list_objects(state, &b, query).await,
