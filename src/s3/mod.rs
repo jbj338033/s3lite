@@ -6,6 +6,7 @@ pub mod cors;
 pub mod dispatch;
 pub mod listing;
 pub mod lock;
+pub mod maintenance;
 pub mod multipart;
 pub mod object;
 pub mod state;
