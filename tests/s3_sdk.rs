@@ -1457,3 +1457,312 @@ async fn suspended_writes_to_null_keeps_old_versions() {
     let body = got_e1.body.collect().await.unwrap().into_bytes();
     assert_eq!(body.as_ref(), b"e1");
 }
+
+// ---------------- Phase 8: copy ----------------
+
+#[tokio::test]
+async fn copy_object_same_bucket_dedups_bytes() {
+    let h = start_server().await;
+    let bucket = "cp-same";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+
+    let payload = b"to be copied".to_vec();
+    let put = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("src")
+        .body(ByteStream::from(payload.clone()))
+        .send()
+        .await
+        .unwrap();
+    let src_etag = put.e_tag().unwrap().to_string();
+
+    let cp = h
+        .client
+        .copy_object()
+        .bucket(bucket)
+        .key("dst")
+        .copy_source(format!("{bucket}/src"))
+        .send()
+        .await
+        .expect("copy_object");
+    let result_etag = cp.copy_object_result().and_then(|r| r.e_tag()).unwrap();
+    assert_eq!(result_etag, src_etag, "copied ETag must equal source ETag");
+
+    let got = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("dst")
+        .send()
+        .await
+        .unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), payload.as_slice());
+}
+
+#[tokio::test]
+async fn copy_object_cross_bucket() {
+    let h = start_server().await;
+    h.client.create_bucket().bucket("src-b").send().await.unwrap();
+    h.client.create_bucket().bucket("dst-b").send().await.unwrap();
+
+    h.client
+        .put_object()
+        .bucket("src-b")
+        .key("k")
+        .body(ByteStream::from(b"cross".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    h.client
+        .copy_object()
+        .bucket("dst-b")
+        .key("k2")
+        .copy_source("src-b/k")
+        .send()
+        .await
+        .expect("cross-bucket copy");
+
+    let got = h.client.get_object().bucket("dst-b").key("k2").send().await.unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"cross");
+}
+
+#[tokio::test]
+async fn copy_object_metadata_directive_replace() {
+    let h = start_server().await;
+    let bucket = "cp-meta";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("src")
+        .metadata("origin", "original")
+        .body(ByteStream::from(b"data".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    h.client
+        .copy_object()
+        .bucket(bucket)
+        .key("dst")
+        .copy_source(format!("{bucket}/src"))
+        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+        .metadata("origin", "copy")
+        .send()
+        .await
+        .unwrap();
+
+    let head = h.client.head_object().bucket(bucket).key("dst").send().await.unwrap();
+    let meta = head.metadata().unwrap();
+    assert_eq!(meta.get("origin").map(String::as_str), Some("copy"));
+}
+
+#[tokio::test]
+async fn copy_object_with_explicit_version_id() {
+    let h = start_server().await;
+    let bucket = "cp-ver";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    enable_versioning(&h, bucket).await;
+
+    let v1 = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("src")
+        .body(ByteStream::from(b"v1".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let v1_id = v1.version_id().unwrap().to_string();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("src")
+        .body(ByteStream::from(b"v2".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    h.client
+        .copy_object()
+        .bucket(bucket)
+        .key("dst")
+        .copy_source(format!("{bucket}/src?versionId={v1_id}"))
+        .send()
+        .await
+        .unwrap();
+
+    let got = h.client.get_object().bucket(bucket).key("dst").send().await.unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"v1");
+}
+
+#[tokio::test]
+async fn upload_part_copy_whole_object() {
+    let h = start_server().await;
+    let bucket = "upc-whole";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    // Source is a 5 MiB object so it can be used as a multipart "part 1".
+    let payload = vec![b'a'; 5 * 1024 * 1024];
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("src")
+        .body(ByteStream::from(payload.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    let init = h
+        .client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key("dst")
+        .send()
+        .await
+        .unwrap();
+    let upload_id = init.upload_id().unwrap().to_string();
+
+    let upc = h
+        .client
+        .upload_part_copy()
+        .bucket(bucket)
+        .key("dst")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .copy_source(format!("{bucket}/src"))
+        .send()
+        .await
+        .expect("upload_part_copy");
+    let part_etag = upc.copy_part_result().and_then(|r| r.e_tag()).unwrap().to_string();
+
+    let tail = b"tail".to_vec();
+    let up2 = h
+        .client
+        .upload_part()
+        .bucket(bucket)
+        .key("dst")
+        .upload_id(&upload_id)
+        .part_number(2)
+        .body(ByteStream::from(tail.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    h.client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key("dst")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .parts(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(&part_etag)
+                        .build(),
+                )
+                .parts(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(2)
+                        .e_tag(up2.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let got = h.client.get_object().bucket(bucket).key("dst").send().await.unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    let mut expected = payload.clone();
+    expected.extend_from_slice(&tail);
+    assert_eq!(body.as_ref(), expected.as_slice());
+}
+
+#[tokio::test]
+async fn upload_part_copy_with_range() {
+    let h = start_server().await;
+    let bucket = "upc-range";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("src")
+        .body(ByteStream::from(payload.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    let init = h
+        .client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key("dst")
+        .send()
+        .await
+        .unwrap();
+    let upload_id = init.upload_id().unwrap().to_string();
+
+    // Inclusive byte range — copies "cdefg"
+    let upc = h
+        .client
+        .upload_part_copy()
+        .bucket(bucket)
+        .key("dst")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .copy_source(format!("{bucket}/src"))
+        .copy_source_range("bytes=2-6")
+        .send()
+        .await
+        .expect("ranged upload_part_copy");
+    let etag = upc.copy_part_result().and_then(|r| r.e_tag()).unwrap().to_string();
+
+    h.client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key("dst")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .parts(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(&etag)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let got = h.client.get_object().bucket(bucket).key("dst").send().await.unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"cdefg");
+}
+
+#[tokio::test]
+async fn copy_object_missing_source_returns_no_such_key() {
+    let h = start_server().await;
+    h.client.create_bucket().bucket("cp-mss").send().await.unwrap();
+    let err = h
+        .client
+        .copy_object()
+        .bucket("cp-mss")
+        .key("dst")
+        .copy_source("cp-mss/does-not-exist")
+        .send()
+        .await
+        .expect_err("copy from missing source should fail");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("NoSuchKey"), "expected NoSuchKey, got {msg}");
+}
