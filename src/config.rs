@@ -15,6 +15,11 @@ pub struct ServerConfig {
     pub region: String,
     pub root_key: RootKey,
     pub listen_addr: SocketAddr,
+    /// Public host suffix used to detect virtual-hosted addressing.
+    /// If the incoming `Host` matches `<bucket>.<endpoint_host>`, the bucket
+    /// is extracted from the subdomain; otherwise path-style is assumed.
+    /// `None` disables virtual-hosted detection (path-style only).
+    pub endpoint_host: Option<String>,
     /// Maximum bytes buffered from a request body for Sigv4 verification.
     /// Larger bodies (multipart UploadPart with signed payload) hit this
     /// limit; streaming-signed and unsigned-payload paths skip buffering
@@ -36,6 +41,7 @@ impl ServerConfig {
                 secret_access_key: secret_access_key.into(),
             },
             listen_addr,
+            endpoint_host: None,
             max_signed_body_bytes: 64 * 1024 * 1024,
         })
     }
