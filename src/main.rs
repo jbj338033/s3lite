@@ -71,6 +71,7 @@ enum Command {
 
 fn main() -> ExitCode {
     init_tracing();
+    install_crypto_provider();
     let cli = Cli::parse();
     match cli.cmd {
         Command::Init {
@@ -159,6 +160,13 @@ fn main() -> ExitCode {
             }
         },
     }
+}
+
+/// rustls 0.23 dropped its built-in default crypto provider; pick `ring`
+/// once at process start so both the inbound TLS listener and any outbound
+/// reqwest clients agree on the same backend. Safe to call multiple times.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 fn init_tracing() {
@@ -253,18 +261,39 @@ async fn serve_command(config_path: PathBuf) -> Result<(), String> {
     let _daemon = spawn_daemon(state.clone(), DEFAULT_MAINTENANCE_INTERVAL);
 
     let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind(config.listen_addr)
-        .await
-        .map_err(|e| format!("bind {}: {e}", config.listen_addr))?;
-    let local_addr = listener
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| config.listen_addr.to_string());
-    tracing::info!(addr = %local_addr, "s3lite listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| format!("server: {e}"))?;
+    let addr = config.listen_addr;
+
+    if let Some(tls) = &config.tls {
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+                .await
+                .map_err(|e| format!("load TLS cert/key: {e}"))?;
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+        });
+        tracing::info!(addr = %addr, tls = true, "s3lite listening");
+        axum_server::bind_rustls(addr, rustls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|e| format!("server: {e}"))?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("bind {addr}: {e}"))?;
+        let local_addr = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| addr.to_string());
+        tracing::info!(addr = %local_addr, tls = false, "s3lite listening");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(|e| format!("server: {e}"))?;
+    }
     Ok(())
 }
 
