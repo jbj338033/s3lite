@@ -5,13 +5,18 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::http::error::{S3Error, S3ErrorCode};
-use crate::storage::manifest::{BucketConfig, VersioningState};
+use crate::storage::manifest::{
+    AbortIncompleteMultipart, BucketConfig, LifecycleExpiration, LifecycleRule, LifecycleStatus,
+    NoncurrentVersionExpiration, VersioningState,
+};
 use crate::storage::MetaError;
 
 use super::state::AppState;
 use super::xml::{
-    BucketEntry, Buckets, GetVersioningConfiguration, ListAllMyBucketsResult, LocationConstraint,
-    Owner, PutVersioningConfiguration, XmlBody,
+    AbortIncompleteMultipartXml, BucketEntry, Buckets, GetVersioningConfiguration,
+    LifecycleConfigurationXml, LifecycleExpirationXml, LifecycleFilterXml, LifecycleRuleXml,
+    ListAllMyBucketsResult, LocationConstraint, NoncurrentVersionExpirationXml, Owner,
+    PutVersioningConfiguration, XmlBody,
 };
 
 const OWNER_ID: &str = "s3lite";
@@ -164,6 +169,112 @@ pub async fn put_bucket_versioning(
     };
     match state.meta.update_bucket_versioning(bucket, new_state).await {
         Ok(()) => Ok(StatusCode::OK.into_response()),
+        Err(MetaError::BucketNotFound(_)) => Err(no_such_bucket(bucket)),
+        Err(e) => Err(map_meta_err(e)),
+    }
+}
+
+/// `PUT /bucket?lifecycle` — replace the lifecycle rules.
+pub async fn put_bucket_lifecycle(
+    state: AppState,
+    bucket: &str,
+    body: Bytes,
+) -> Result<Response, S3Error> {
+    let parsed: LifecycleConfigurationXml = quick_xml::de::from_reader(body.as_ref()).map_err(
+        |e| {
+            S3Error::new(
+                S3ErrorCode::InvalidRequest,
+                format!("malformed LifecycleConfiguration body: {e}"),
+            )
+            .with_resource(format!("/{bucket}"))
+        },
+    )?;
+    let rules: Vec<LifecycleRule> = parsed
+        .rules
+        .into_iter()
+        .map(|r| {
+            let status = match r.status.as_str() {
+                "Enabled" => LifecycleStatus::Enabled,
+                _ => LifecycleStatus::Disabled,
+            };
+            LifecycleRule {
+                id: r.id,
+                status,
+                filter_prefix: r.filter.and_then(|f| f.prefix),
+                expiration: r.expiration.map(|e| LifecycleExpiration { days: e.days }),
+                noncurrent_version_expiration: r
+                    .noncurrent_version_expiration
+                    .map(|n| NoncurrentVersionExpiration {
+                        noncurrent_days: n.noncurrent_days,
+                    }),
+                abort_incomplete_multipart_upload: r.abort_incomplete_multipart_upload.map(|a| {
+                    AbortIncompleteMultipart {
+                        days_after_initiation: a.days_after_initiation,
+                    }
+                }),
+            }
+        })
+        .collect();
+    match state.meta.update_bucket_lifecycle(bucket, rules).await {
+        Ok(()) => Ok(StatusCode::OK.into_response()),
+        Err(MetaError::BucketNotFound(_)) => Err(no_such_bucket(bucket)),
+        Err(e) => Err(map_meta_err(e)),
+    }
+}
+
+/// `GET /bucket?lifecycle` — return the current lifecycle configuration.
+pub async fn get_bucket_lifecycle(
+    state: AppState,
+    bucket: &str,
+) -> Result<Response, S3Error> {
+    let cfg = state
+        .meta
+        .get_bucket(bucket)
+        .await
+        .map_err(map_meta_err)?
+        .ok_or_else(|| no_such_bucket(bucket))?;
+    if cfg.lifecycle_rules.is_empty() {
+        return Err(S3Error::new(
+            S3ErrorCode::NoSuchLifecycleConfiguration,
+            "no lifecycle configuration found",
+        )
+        .with_resource(format!("/{bucket}")));
+    }
+    let body = LifecycleConfigurationXml {
+        rules: cfg
+            .lifecycle_rules
+            .into_iter()
+            .map(|r| LifecycleRuleXml {
+                id: r.id,
+                status: match r.status {
+                    LifecycleStatus::Enabled => "Enabled".to_string(),
+                    LifecycleStatus::Disabled => "Disabled".to_string(),
+                },
+                filter: r.filter_prefix.map(|p| LifecycleFilterXml { prefix: Some(p) }),
+                expiration: r.expiration.map(|e| LifecycleExpirationXml { days: e.days }),
+                noncurrent_version_expiration: r.noncurrent_version_expiration.map(|n| {
+                    NoncurrentVersionExpirationXml {
+                        noncurrent_days: n.noncurrent_days,
+                    }
+                }),
+                abort_incomplete_multipart_upload: r.abort_incomplete_multipart_upload.map(|a| {
+                    AbortIncompleteMultipartXml {
+                        days_after_initiation: a.days_after_initiation,
+                    }
+                }),
+            })
+            .collect(),
+    };
+    Ok(XmlBody(body).into_response())
+}
+
+/// `DELETE /bucket?lifecycle` — remove the lifecycle configuration.
+pub async fn delete_bucket_lifecycle(
+    state: AppState,
+    bucket: &str,
+) -> Result<Response, S3Error> {
+    match state.meta.update_bucket_lifecycle(bucket, Vec::new()).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
         Err(MetaError::BucketNotFound(_)) => Err(no_such_bucket(bucket)),
         Err(e) => Err(map_meta_err(e)),
     }
