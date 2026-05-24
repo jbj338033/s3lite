@@ -7,12 +7,14 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::http::error::{S3Error, S3ErrorCode};
+use crate::storage::manifest::ManifestKind;
 use crate::storage::{ListCursor, ListItem, ListObjectsRequest, MetaError};
 
 use super::bucket::map_meta_err;
 use super::state::AppState;
 use super::xml::{
-    CommonPrefix, ListBucketResultV1, ListBucketResultV2, ObjectContent, XmlBody,
+    CommonPrefix, DeleteMarkerEntry, ListBucketResultV1, ListBucketResultV2, ListVersionsResult,
+    ObjectContent, ObjectVersion, XmlBody,
 };
 
 const DEFAULT_MAX_KEYS: u32 = 1000;
@@ -144,6 +146,88 @@ async fn list_v1(
         next_marker,
         contents,
         common_prefixes,
+    };
+    Ok(XmlBody(body).into_response())
+}
+
+/// `GET /bucket?versions` — list all committed versions and delete markers.
+pub async fn list_object_versions(
+    state: AppState,
+    bucket: &str,
+    query: &str,
+) -> Result<Response, S3Error> {
+    require_bucket(&state, bucket).await?;
+    let params = parse_query(query);
+
+    let prefix = params.get("prefix").cloned().unwrap_or_default();
+    let delimiter = params.get("delimiter").cloned().filter(|s| !s.is_empty());
+    let max_keys = parse_max_keys(params.get("max-keys"))?;
+    let encoding = parse_encoding(params.get("encoding-type"))?;
+    let key_marker = params.get("key-marker").cloned().unwrap_or_default();
+
+    let cursor = if key_marker.is_empty() {
+        None
+    } else {
+        Some(ListCursor::AfterKey(key_marker.clone()))
+    };
+
+    let page = state
+        .meta
+        .list_object_versions(ListObjectsRequest {
+            bucket: bucket.to_string(),
+            prefix: prefix.clone(),
+            delimiter: delimiter.clone(),
+            cursor,
+            limit: max_keys as usize,
+        })
+        .await
+        .map_err(map_meta_err)?;
+
+    let mut versions: Vec<ObjectVersion> = Vec::new();
+    let mut delete_markers: Vec<DeleteMarkerEntry> = Vec::new();
+    for entry in page.entries {
+        let m = entry.manifest;
+        let key_enc = encode_value(&m.key.key, encoding.as_deref());
+        let last_modified = format_iso8601(m.last_modified);
+        match m.kind {
+            ManifestKind::Object => versions.push(ObjectVersion {
+                key: key_enc,
+                version_id: m.key.version_id.clone(),
+                is_latest: entry.is_latest,
+                last_modified,
+                etag: m.etag(),
+                size: m.size,
+                storage_class: m.storage_class.clone(),
+            }),
+            ManifestKind::Tombstone => delete_markers.push(DeleteMarkerEntry {
+                key: key_enc,
+                version_id: m.key.version_id.clone(),
+                is_latest: entry.is_latest,
+                last_modified,
+            }),
+        }
+    }
+
+    let next_key_marker = if page.truncated {
+        page.next_cursor.as_ref().map(|c| match c {
+            ListCursor::AfterKey(k) => encode_value(k, encoding.as_deref()),
+            ListCursor::AfterPrefix(p) => encode_value(p, encoding.as_deref()),
+        })
+    } else {
+        None
+    };
+
+    let body = ListVersionsResult {
+        name: bucket.to_string(),
+        prefix: encode_value(&prefix, encoding.as_deref()),
+        key_marker,
+        max_keys,
+        delimiter: delimiter.map(|d| encode_value(&d, encoding.as_deref())),
+        is_truncated: page.truncated,
+        encoding_type: encoding,
+        next_key_marker,
+        versions,
+        delete_markers,
     };
     Ok(XmlBody(body).into_response())
 }
