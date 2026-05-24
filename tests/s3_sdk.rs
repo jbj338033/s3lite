@@ -1147,3 +1147,313 @@ async fn list_v2_etag_and_size_in_contents() {
         Some(&aws_sdk_s3::types::ObjectStorageClass::Standard)
     );
 }
+
+// ---------------- Phase 7: versioning ----------------
+
+async fn enable_versioning(h: &Harness, bucket: &str) {
+    h.client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("put_bucket_versioning Enabled");
+}
+
+#[tokio::test]
+async fn versioning_get_returns_off_initially() {
+    let h = start_server().await;
+    h.client.create_bucket().bucket("vbk").send().await.unwrap();
+    let resp = h.client.get_bucket_versioning().bucket("vbk").send().await.unwrap();
+    assert!(
+        resp.status().is_none(),
+        "expected no Status on fresh bucket, got {:?}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn versioning_put_get_roundtrip() {
+    let h = start_server().await;
+    h.client.create_bucket().bucket("vbk").send().await.unwrap();
+    enable_versioning(&h, "vbk").await;
+    let resp = h.client.get_bucket_versioning().bucket("vbk").send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        Some(&aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+    );
+}
+
+#[tokio::test]
+async fn enabled_put_returns_distinct_version_ids() {
+    let h = start_server().await;
+    let bucket = "ver-puts";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    enable_versioning(&h, bucket).await;
+
+    let r1 = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"v1".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let r2 = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"v2".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    let id1 = r1.version_id().unwrap();
+    let id2 = r2.version_id().unwrap();
+    assert_ne!(id1, id2, "Enabled PUTs must yield distinct version ids");
+
+    // GET (no version) returns the latest
+    let got = h.client.get_object().bucket(bucket).key("k").send().await.unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"v2");
+
+    // GET versionId targets the older one
+    let got_v1 = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("k")
+        .version_id(id1)
+        .send()
+        .await
+        .unwrap();
+    let body = got_v1.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"v1");
+}
+
+#[tokio::test]
+async fn enabled_delete_creates_marker_and_hides_latest() {
+    let h = start_server().await;
+    let bucket = "ver-del";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    enable_versioning(&h, bucket).await;
+
+    let r1 = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"v1".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let v1_id = r1.version_id().unwrap().to_string();
+
+    let del = h.client.delete_object().bucket(bucket).key("k").send().await.unwrap();
+    assert_eq!(del.delete_marker(), Some(true));
+    let marker_id = del.version_id().unwrap().to_string();
+    assert_ne!(marker_id, v1_id);
+
+    // GET (no version) now 404 — latest is a tombstone
+    let err = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("k")
+        .send()
+        .await
+        .expect_err("GET after tombstone should fail");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("NoSuchKey"), "expected NoSuchKey, got {msg}");
+
+    // GET versionId on the original still returns v1
+    let got = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&v1_id)
+        .send()
+        .await
+        .unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"v1");
+
+    // ListObjectsV2 hides the key entirely
+    let listed = h
+        .client
+        .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap();
+    assert!(listed.contents().is_empty(), "tombstoned key must not appear");
+}
+
+#[tokio::test]
+async fn delete_version_id_permanently_removes() {
+    let h = start_server().await;
+    let bucket = "ver-perm";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    enable_versioning(&h, bucket).await;
+
+    let r1 = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"v1".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let v1_id = r1.version_id().unwrap().to_string();
+    let r2 = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"v2".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let v2_id = r2.version_id().unwrap().to_string();
+
+    // Permanently delete v2 → latest becomes v1
+    h.client
+        .delete_object()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&v2_id)
+        .send()
+        .await
+        .unwrap();
+
+    let got = h.client.get_object().bucket(bucket).key("k").send().await.unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"v1");
+
+    // v2 specifically is gone
+    let err = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&v2_id)
+        .send()
+        .await
+        .expect_err("v2 should be unreachable");
+    let _ = err;
+
+    // v1 still present
+    let _ = h.client.get_object().bucket(bucket).key("k").version_id(&v1_id).send().await.unwrap();
+}
+
+#[tokio::test]
+async fn list_object_versions_shows_all_with_is_latest() {
+    let h = start_server().await;
+    let bucket = "ver-list";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    enable_versioning(&h, bucket).await;
+
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"v1".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"v2".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    h.client.delete_object().bucket(bucket).key("k").send().await.unwrap();
+
+    let resp = h
+        .client
+        .list_object_versions()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("list_object_versions");
+
+    let versions = resp.versions();
+    let markers = resp.delete_markers();
+    assert_eq!(versions.len(), 2, "expected 2 versions, got {versions:?}");
+    assert_eq!(markers.len(), 1, "expected 1 delete marker");
+    // The delete marker should be the latest
+    assert_eq!(markers[0].is_latest(), Some(true));
+    // Exactly one of the two object versions should NOT be latest
+    let latest_versions = versions.iter().filter(|v| v.is_latest() == Some(true)).count();
+    assert_eq!(latest_versions, 0, "no object version should be latest when delete marker is latest");
+}
+
+#[tokio::test]
+async fn suspended_writes_to_null_keeps_old_versions() {
+    let h = start_server().await;
+    let bucket = "ver-susp";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    enable_versioning(&h, bucket).await;
+
+    let r1 = h
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"e1".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let enabled_id = r1.version_id().unwrap().to_string();
+
+    // Suspend
+    h.client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Suspended)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    // PUT under Suspended → version_id "null"
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"s1".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    // GET returns the most-recent (suspended write)
+    let got = h.client.get_object().bucket(bucket).key("k").send().await.unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"s1");
+
+    // Old enabled-mode version still accessible
+    let got_e1 = h
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key("k")
+        .version_id(&enabled_id)
+        .send()
+        .await
+        .unwrap();
+    let body = got_e1.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"e1");
+}
