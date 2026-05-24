@@ -78,6 +78,9 @@ async fn handle(
         (Method::GET, Some(b), None) if has_query_flag(query, "location") => {
             bucket::get_bucket_location(state, &b).await
         }
+        (Method::GET, Some(b), None) if has_query_flag(query, "versions") => {
+            listing::list_object_versions(state, &b, query).await
+        }
         // Bucket-level catch-alls
         (Method::PUT, Some(b), None) => bucket::create_bucket(state, &b).await,
         (Method::DELETE, Some(b), None) => bucket::delete_bucket(state, &b).await,
