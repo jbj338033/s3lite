@@ -29,6 +29,8 @@ pub enum S3ErrorCode {
     PreconditionFailed,
     NotModified,
     InvalidBucketName,
+    NoSuchCorsConfiguration,
+    AccessForbidden,
 }
 
 impl S3ErrorCode {
@@ -51,6 +53,8 @@ impl S3ErrorCode {
             BucketAlreadyExists | BucketAlreadyOwnedByYou | BucketNotEmpty => StatusCode::CONFLICT,
             PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             NotModified => StatusCode::NOT_MODIFIED,
+            NoSuchCorsConfiguration => StatusCode::NOT_FOUND,
+            AccessForbidden => StatusCode::FORBIDDEN,
         }
     }
 
@@ -77,6 +81,8 @@ impl S3ErrorCode {
             PreconditionFailed => "PreconditionFailed",
             NotModified => "NotModified",
             InvalidBucketName => "InvalidBucketName",
+            NoSuchCorsConfiguration => "NoSuchCORSConfiguration",
+            AccessForbidden => "AccessForbidden",
         }
     }
 }

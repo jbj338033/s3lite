@@ -78,6 +78,13 @@ pub async fn sigv4_mw(
     req: Request,
     next: Next,
 ) -> Result<Response, S3Error> {
+    // CORS preflight requests carry no Sigv4 signature by design — let them
+    // through unauthenticated. The CORS handler in s3::cors decides whether
+    // to accept based on the bucket's configured rules.
+    if req.method() == axum::http::Method::OPTIONS {
+        return Ok(next.run(req).await);
+    }
+
     let request_id_ext = req.extensions().get::<RequestId>().cloned();
     let resource_path = req.uri().path().to_string();
     let decorate = |mut e: S3Error| {
