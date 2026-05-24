@@ -24,6 +24,7 @@ struct Harness {
     _dir: TempDir,
     _server: tokio::task::JoinHandle<()>,
     client: Client,
+    endpoint: String,
 }
 
 async fn start_server() -> Harness {
@@ -50,6 +51,7 @@ async fn start_server() -> Harness {
     });
 
     let endpoint = format!("http://{addr}");
+    let endpoint_str = endpoint.clone();
     let creds = Credentials::new(AK, SK, None, None, "test");
     let sdk_config = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(REGION))
@@ -66,6 +68,7 @@ async fn start_server() -> Harness {
         _dir: dir,
         _server: server,
         client,
+        endpoint: endpoint_str,
     }
 }
 
@@ -1766,3 +1769,276 @@ async fn copy_object_missing_source_returns_no_such_key() {
     let msg = format!("{err:?}");
     assert!(msg.contains("NoSuchKey"), "expected NoSuchKey, got {msg}");
 }
+
+// ---------------- Phase 9: tagging ----------------
+
+#[tokio::test]
+async fn put_get_object_tagging_roundtrip() {
+    let h = start_server().await;
+    let bucket = "tag-rt";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    h.client
+        .put_object_tagging()
+        .bucket(bucket)
+        .key("k")
+        .tagging(
+            aws_sdk_s3::types::Tagging::builder()
+                .tag_set(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("env")
+                        .value("prod")
+                        .build()
+                        .unwrap(),
+                )
+                .tag_set(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("team")
+                        .value("infra")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("put_object_tagging");
+
+    let resp = h
+        .client
+        .get_object_tagging()
+        .bucket(bucket)
+        .key("k")
+        .send()
+        .await
+        .expect("get_object_tagging");
+    let mut pairs: Vec<(String, String)> = resp
+        .tag_set()
+        .iter()
+        .map(|t| (t.key().to_string(), t.value().to_string()))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("env".to_string(), "prod".to_string()),
+            ("team".to_string(), "infra".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn x_amz_tagging_header_on_put_sets_tags() {
+    let h = start_server().await;
+    let bucket = "tag-hdr";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .tagging("env=staging&owner=alice")
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = h
+        .client
+        .get_object_tagging()
+        .bucket(bucket)
+        .key("k")
+        .send()
+        .await
+        .unwrap();
+    let mut pairs: Vec<(String, String)> = resp
+        .tag_set()
+        .iter()
+        .map(|t| (t.key().to_string(), t.value().to_string()))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("env".to_string(), "staging".to_string()),
+            ("owner".to_string(), "alice".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn delete_object_tagging_clears_all() {
+    let h = start_server().await;
+    let bucket = "tag-del";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_object()
+        .bucket(bucket)
+        .key("k")
+        .tagging("a=1&b=2")
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    h.client
+        .delete_object_tagging()
+        .bucket(bucket)
+        .key("k")
+        .send()
+        .await
+        .expect("delete_object_tagging");
+
+    let resp = h
+        .client
+        .get_object_tagging()
+        .bucket(bucket)
+        .key("k")
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.tag_set().is_empty());
+}
+
+// ---------------- Phase 9: CORS ----------------
+
+#[tokio::test]
+async fn cors_put_get_roundtrip() {
+    let h = start_server().await;
+    let bucket = "cors-rt";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    let rule = aws_sdk_s3::types::CorsRule::builder()
+        .allowed_origins("https://example.com")
+        .allowed_methods("GET")
+        .allowed_methods("PUT")
+        .allowed_headers("Content-Type")
+        .max_age_seconds(3600)
+        .build()
+        .unwrap();
+    h.client
+        .put_bucket_cors()
+        .bucket(bucket)
+        .cors_configuration(
+            aws_sdk_s3::types::CorsConfiguration::builder()
+                .cors_rules(rule)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("put_bucket_cors");
+
+    let resp = h
+        .client
+        .get_bucket_cors()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("get_bucket_cors");
+    let rules = resp.cors_rules();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].allowed_origins(), &["https://example.com"]);
+    assert_eq!(rules[0].max_age_seconds(), Some(3600));
+}
+
+#[tokio::test]
+async fn cors_preflight_returns_allow_headers() {
+    let h = start_server().await;
+    let bucket = "cors-pre";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_bucket_cors()
+        .bucket(bucket)
+        .cors_configuration(
+            aws_sdk_s3::types::CorsConfiguration::builder()
+                .cors_rules(
+                    aws_sdk_s3::types::CorsRule::builder()
+                        .allowed_origins("https://app.example")
+                        .allowed_methods("GET")
+                        .allowed_methods("PUT")
+                        .allowed_headers("authorization")
+                        .max_age_seconds(60)
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    // Send OPTIONS via reqwest (the SDK doesn't expose preflight directly).
+    let endpoint = h.endpoint.clone();
+    let client = reqwest::Client::new();
+    let resp = client
+        .request(reqwest::Method::OPTIONS, format!("{endpoint}/{bucket}/key"))
+        .header("Origin", "https://app.example")
+        .header("Access-Control-Request-Method", "PUT")
+        .header("Access-Control-Request-Headers", "authorization")
+        .send()
+        .await
+        .expect("preflight HTTP");
+    assert!(resp.status().is_success(), "preflight returned {}", resp.status());
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").and_then(|h| h.to_str().ok()),
+        Some("https://app.example")
+    );
+    let methods = resp
+        .headers()
+        .get("access-control-allow-methods")
+        .and_then(|h| h.to_str().ok())
+        .unwrap();
+    assert!(methods.contains("PUT"));
+    assert_eq!(
+        resp.headers()
+            .get("access-control-max-age")
+            .and_then(|h| h.to_str().ok()),
+        Some("60")
+    );
+}
+
+#[tokio::test]
+async fn cors_preflight_rejected_without_matching_rule() {
+    let h = start_server().await;
+    let bucket = "cors-deny";
+    h.client.create_bucket().bucket(bucket).send().await.unwrap();
+    h.client
+        .put_bucket_cors()
+        .bucket(bucket)
+        .cors_configuration(
+            aws_sdk_s3::types::CorsConfiguration::builder()
+                .cors_rules(
+                    aws_sdk_s3::types::CorsRule::builder()
+                        .allowed_origins("https://allowed.example")
+                        .allowed_methods("GET")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let endpoint = h.endpoint.clone();
+    let client = reqwest::Client::new();
+    let resp = client
+        .request(reqwest::Method::OPTIONS, format!("{endpoint}/{bucket}/key"))
+        .header("Origin", "https://elsewhere.example")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+}
+
