@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+arc-swap = "1"
 redb = "2"
 blake3 = "1"
 md-5 = "0.10"
