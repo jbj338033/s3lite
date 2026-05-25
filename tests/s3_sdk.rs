@@ -2960,3 +2960,179 @@ async fn https_serves_health_with_self_signed_cert() {
     let body = resp.text().await.unwrap();
     assert_eq!(body, "ok");
 }
+
+// ---------------- Hot config reload ----------------
+
+/// Verify that an in-place `AppState.config.store(...)` immediately rotates
+/// the credentials used by middleware on subsequent requests — this is the
+/// mechanism SIGHUP triggers in `main::reload_loop`.
+#[tokio::test]
+async fn live_config_swap_rotates_credentials() {
+    let h = start_server().await;
+
+    let new_ak = "AKIAROTATED000000000";
+    // KSecretKey caps at 40 bytes (AWS standard secret length).
+    let new_sk = "rotated-secret-rotated-secret-rotated123";
+
+    // Old credentials work before rotation.
+    h.client
+        .list_buckets()
+        .send()
+        .await
+        .expect("old creds should work pre-rotation");
+
+    // Publish a fresh config with new root key — same listen_addr/region.
+    let new_config = ServerConfig::new(
+        REGION,
+        new_ak,
+        new_sk,
+        h.endpoint
+            .strip_prefix("http://")
+            .unwrap()
+            .parse::<SocketAddr>()
+            .unwrap(),
+    );
+    h.state.config.store(new_config);
+
+    // Old credentials now rejected as InvalidAccessKeyId.
+    let err = h
+        .client
+        .list_buckets()
+        .send()
+        .await
+        .expect_err("old creds must fail after rotation");
+    let raw = err.into_service_error();
+    assert_eq!(raw.meta().code().unwrap_or(""), "InvalidAccessKeyId");
+
+    // New credentials work.
+    let creds = Credentials::new(new_ak, new_sk, None, None, "test");
+    let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+        .region(Region::new(REGION))
+        .credentials_provider(creds)
+        .endpoint_url(h.endpoint.clone())
+        .load()
+        .await;
+    let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+        .force_path_style(true)
+        .build();
+    let client = Client::from_conf(s3_config);
+    client
+        .list_buckets()
+        .send()
+        .await
+        .expect("new creds should work after rotation");
+}
+
+// ---------------- Sigv4 error mapping ----------------
+
+/// SDK client signed with the right secret but the wrong access key id —
+/// scratchstack's `unknown access key` path must surface as
+/// `InvalidAccessKeyId` (403), not the generic `SignatureDoesNotMatch`.
+#[tokio::test]
+async fn unknown_access_key_returns_invalid_access_key_id() {
+    let h = start_server().await;
+    let wrong_ak = "AKIAUNREGISTERED0000";
+    let creds = Credentials::new(wrong_ak, SK, None, None, "test");
+    let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+        .region(Region::new(REGION))
+        .credentials_provider(creds)
+        .endpoint_url(h.endpoint.clone())
+        .load()
+        .await;
+    let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+        .force_path_style(true)
+        .build();
+    let client = Client::from_conf(s3_config);
+
+    let err = client
+        .list_buckets()
+        .send()
+        .await
+        .expect_err("expected InvalidAccessKeyId");
+    let raw = err.into_service_error();
+    let code = raw.meta().code().unwrap_or("");
+    assert_eq!(code, "InvalidAccessKeyId", "raw error: {raw:?}");
+}
+
+/// Right access key, wrong secret — signature mismatch path.
+#[tokio::test]
+async fn wrong_secret_returns_signature_does_not_match() {
+    let h = start_server().await;
+    let bad_secret = "0000000000000000000000000000000000000000";
+    let creds = Credentials::new(AK, bad_secret, None, None, "test");
+    let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+        .region(Region::new(REGION))
+        .credentials_provider(creds)
+        .endpoint_url(h.endpoint.clone())
+        .load()
+        .await;
+    let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+        .force_path_style(true)
+        .build();
+    let client = Client::from_conf(s3_config);
+
+    let err = client
+        .list_buckets()
+        .send()
+        .await
+        .expect_err("expected SignatureDoesNotMatch");
+    let raw = err.into_service_error();
+    let code = raw.meta().code().unwrap_or("");
+    assert_eq!(code, "SignatureDoesNotMatch", "raw error: {raw:?}");
+}
+
+/// Skewed clock — sign a presigned URL with an `X-Amz-Date` 30 minutes in
+/// the future. The presigned verifier already returns `RequestTimeTooSkewed`;
+/// this guards against a regression in `map_sigv4_error`'s header-signed
+/// "Signature not yet current" path.
+#[tokio::test]
+async fn skewed_header_signed_request_returns_request_time_too_skewed() {
+    use aws_sigv4::http_request::{
+        SignableBody, SignableRequest, SigningSettings, sign,
+    };
+    use aws_sigv4::sign::v4::SigningParams;
+    use aws_credential_types::Credentials as SigvCreds;
+
+    let h = start_server().await;
+    let creds = SigvCreds::new(AK, SK, None, None, "test");
+    let settings = SigningSettings::default();
+    let identity = creds.into();
+    let future_time = std::time::SystemTime::now() + std::time::Duration::from_secs(60 * 30);
+    let params: aws_sigv4::http_request::SigningParams<'_> = SigningParams::builder()
+        .identity(&identity)
+        .region(REGION)
+        .name("s3")
+        .time(future_time)
+        .settings(settings)
+        .build()
+        .unwrap()
+        .into();
+    let url = format!("{}/", h.endpoint);
+    let signable = SignableRequest::new(
+        "GET",
+        url.clone(),
+        std::iter::empty(),
+        SignableBody::UnsignedPayload,
+    )
+    .unwrap();
+    let (instructions, _) = sign(signable, &params).unwrap().into_parts();
+
+    let mut req = reqwest::Request::new(reqwest::Method::GET, url.parse().unwrap());
+    let (sigv_headers, sigv_query) = instructions.into_parts();
+    for h in sigv_headers {
+        req.headers_mut().insert(
+            reqwest::header::HeaderName::from_bytes(h.name().as_bytes()).unwrap(),
+            reqwest::header::HeaderValue::from_str(h.value()).unwrap(),
+        );
+    }
+    assert!(sigv_query.is_empty(), "no query params expected for header-signed");
+
+    let client = reqwest::Client::new();
+    let resp = client.execute(req).await.unwrap();
+    assert_eq!(resp.status(), 403);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<Code>RequestTimeTooSkewed</Code>"),
+        "expected RequestTimeTooSkewed, got: {body}"
+    );
+}
