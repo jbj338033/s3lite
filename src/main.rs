@@ -174,7 +174,11 @@ fn init_tracing() {
     let json = tracing_subscriber::fmt::layer()
         .json()
         .with_target(true)
-        .with_thread_names(true);
+        .with_thread_names(true)
+        // Stream logs to stderr so stdout stays clean for command output
+        // (e.g. the credentials block `init` prints, or future `--json`
+        // subcommands that emit machine-readable payloads).
+        .with_writer(std::io::stderr);
     tracing_subscriber::registry()
         .with(filter)
         .with(json)
