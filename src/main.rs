@@ -67,6 +67,14 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Container entrypoint: bootstrap config from env vars then serve.
+    /// Designed for the distroless Docker image, which has no shell to wrap
+    /// the binary in. Reads `S3LITE_DATA_DIR`, `S3LITE_LISTEN_ADDR`,
+    /// `S3LITE_REGION`, `S3LITE_ACCESS_KEY_ID`, `S3LITE_SECRET_ACCESS_KEY`,
+    /// `S3LITE_ENDPOINT_HOST`, `S3LITE_TLS_CERT_PATH`, `S3LITE_TLS_KEY_PATH`.
+    /// Creates `<data_dir>/config.toml` on first start (printing generated
+    /// credentials to stdout once if AK/SK env vars are absent).
+    Auto,
 }
 
 fn main() -> ExitCode {
@@ -137,6 +145,22 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Auto => {
+            let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("failed to construct tokio runtime: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match runtime.block_on(auto_command()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("auto failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::ScanRebuild { data_dir } => match admin::scan_rebuild(&data_dir) {
             Ok(report) => {
                 println!(
@@ -183,6 +207,95 @@ fn init_tracing() {
         .with(filter)
         .with(json)
         .init();
+}
+
+/// Container entrypoint: derive everything from env, bootstrap `config.toml`
+/// on first start, then hand off to `serve_command`. Idempotent — re-running
+/// against an already-initialized data dir just re-launches the server with
+/// the existing config.
+async fn auto_command() -> Result<(), String> {
+    let data_dir = std::env::var("S3LITE_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/data"));
+    let config_path = data_dir.join("config.toml");
+
+    if !config_path.exists() {
+        let preexisted = data_dir.exists();
+        std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data_dir: {e}"))?;
+        #[cfg(unix)]
+        if !preexisted {
+            // Only tighten perms on a freshly-created dir. A pre-existing dir
+            // (Docker volume mount, bind mount, operator-prepared path) is the
+            // operator's responsibility — we don't own the perms there.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("chmod data_dir: {e}"))?;
+        }
+
+        let listen_addr = std::env::var("S3LITE_LISTEN_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:9000".to_string());
+        let region = std::env::var("S3LITE_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let endpoint_host = std::env::var("S3LITE_ENDPOINT_HOST").ok();
+        let tls_cert = std::env::var("S3LITE_TLS_CERT_PATH").ok();
+        let tls_key = std::env::var("S3LITE_TLS_KEY_PATH").ok();
+        if tls_cert.is_some() != tls_key.is_some() {
+            return Err(
+                "S3LITE_TLS_CERT_PATH and S3LITE_TLS_KEY_PATH must both be set or both omitted"
+                    .into(),
+            );
+        }
+
+        let env_ak = std::env::var("S3LITE_ACCESS_KEY_ID").ok();
+        let env_sk = std::env::var("S3LITE_SECRET_ACCESS_KEY").ok();
+        let (access_key_id, secret_access_key, generated) = match (env_ak, env_sk) {
+            (Some(ak), Some(sk)) => (ak, sk, false),
+            (None, None) => (generate_access_key(), generate_secret_key(), true),
+            _ => {
+                return Err(
+                    "S3LITE_ACCESS_KEY_ID and S3LITE_SECRET_ACCESS_KEY must both be set or both omitted"
+                        .into(),
+                );
+            }
+        };
+
+        let mut content = format!(
+            r#"region = "{region}"
+listen_addr = "{listen_addr}"
+data_dir = "{data}"
+access_key_id = "{access_key_id}"
+secret_access_key = "{secret_access_key}"
+"#,
+            data = data_dir.display(),
+        );
+        if let Some(host) = endpoint_host {
+            content.push_str(&format!("endpoint_host = \"{host}\"\n"));
+        }
+        if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+            content.push_str(&format!("tls_cert_path = \"{cert}\"\ntls_key_path = \"{key}\"\n"));
+        }
+        std::fs::write(&config_path, content).map_err(|e| format!("write config: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("chmod config: {e}"))?;
+        }
+
+        if generated {
+            println!("s3lite auto-init at {}", data_dir.display());
+            println!();
+            println!("save these credentials — they will not be shown again:");
+            println!("  access_key_id     = {access_key_id}");
+            println!("  secret_access_key = {secret_access_key}");
+        } else {
+            tracing::info!(
+                data_dir = %data_dir.display(),
+                "s3lite auto-init from env credentials"
+            );
+        }
+    }
+
+    serve_command(config_path).await
 }
 
 fn init_command(
