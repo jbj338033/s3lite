@@ -260,14 +260,31 @@ async fn serve_command(config_path: PathBuf) -> Result<(), String> {
 
     let _daemon = spawn_daemon(state.clone(), DEFAULT_MAINTENANCE_INTERVAL);
 
-    let app = build_app(state);
     let addr = config.listen_addr;
+    let tls_config = &config.tls;
 
-    if let Some(tls) = &config.tls {
-        let rustls_config =
+    let rustls_handle = if let Some(tls) = tls_config {
+        Some(
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
                 .await
-                .map_err(|e| format!("load TLS cert/key: {e}"))?;
+                .map_err(|e| format!("load TLS cert/key: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    // SIGHUP: re-read config.toml + (if TLS is enabled) re-load cert/key.
+    // `listen_addr`, `data_dir`, and the TLS termination toggle are bound at
+    // boot — only the in-memory `ServerConfig` and the TLS material rotate.
+    tokio::spawn(reload_loop(
+        config_path.clone(),
+        state.clone(),
+        rustls_handle.clone(),
+    ));
+
+    let app = build_app(state);
+
+    if let Some(rustls_config) = rustls_handle {
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
         tokio::spawn(async move {
@@ -297,6 +314,44 @@ async fn serve_command(config_path: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+async fn reload_loop(
+    config_path: PathBuf,
+    state: AppState,
+    rustls_handle: Option<axum_server::tls_rustls::RustlsConfig>,
+) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sighup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "SIGHUP handler unavailable; reload disabled");
+            return;
+        }
+    };
+    while sighup.recv().await.is_some() {
+        match load_config(&config_path) {
+            Ok((new_cfg, _)) => {
+                state.config.store(new_cfg);
+                tracing::info!("config reloaded from {}", config_path.display());
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "config reload failed; keeping previous");
+            }
+        }
+        if let Some(handle) = &rustls_handle {
+            // We only reach this branch when TLS was enabled at boot, so the
+            // current config (whether old or freshly reloaded) is guaranteed
+            // to have `tls = Some(_)`.
+            let snapshot = state.config_snapshot();
+            if let Some(tls) = &snapshot.tls {
+                match handle.reload_from_pem_file(&tls.cert_path, &tls.key_path).await {
+                    Ok(()) => tracing::info!("TLS cert reloaded"),
+                    Err(e) => tracing::error!(error = %e, "TLS cert reload failed"),
+                }
+            }
+        }
+    }
+}
+
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
@@ -321,9 +376,8 @@ fn generate_access_key() -> String {
 }
 
 fn generate_secret_key() -> String {
-    // 40-byte raw → base64 (60 chars) — comfortably longer than AWS's 40-char
-    // secrets but legal as a Sigv4 secret. Discoverable from the config file
-    // anyway, the entropy is what matters.
+    // 30 raw bytes → base64 = 40 chars (matches AWS secret length so scratchstack's
+    // `KSecretKey` size cap can't reject it).
     let mut bytes = [0u8; 30];
     rand::rng().fill_bytes(&mut bytes);
     BASE64.encode(bytes)
