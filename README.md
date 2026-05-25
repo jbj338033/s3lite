@@ -41,26 +41,57 @@ cargo build --release
 `init` prints the freshly generated `access_key_id` / `secret_access_key`
 exactly once — copy them somewhere safe.
 
+### Docker
+
+Multi-arch image published on every push to `main` and on `v*` tags
+(linux/amd64 + linux/arm64, distroless base, ~20 MB).
+
+```bash
+docker pull ghcr.io/jbj338033/s3lite:latest
+
+# One-shot: random credentials printed to stdout once, then serve.
+docker run --rm -p 9000:9000 -v s3data:/data ghcr.io/jbj338033/s3lite:latest
+
+# Or with explicit credentials.
+docker run --rm -p 9000:9000 -v s3data:/data \
+  -e S3LITE_ACCESS_KEY_ID=AKIA... \
+  -e S3LITE_SECRET_ACCESS_KEY='...' \
+  ghcr.io/jbj338033/s3lite:latest
+```
+
 ### Docker Compose
 
 ```yaml
 services:
   s3:
-    image: s3lite:latest
+    image: ghcr.io/jbj338033/s3lite:latest
     volumes: [s3data:/data]
     ports: ["9000:9000"]
-    command: ["serve", "--config", "/data/config.toml"]
+    environment:
+      S3LITE_ACCESS_KEY_ID: dev-key-dev-key-dev-key-dev-key-dev
+      S3LITE_SECRET_ACCESS_KEY: dev-secret-dev-secret-dev-secret-dev-secr
   app:
     build: .
     depends_on: [s3]
     environment:
       AWS_ENDPOINT_URL_S3: http://s3:9000
       AWS_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: <from init output>
-      AWS_SECRET_ACCESS_KEY: <from init output>
+      AWS_ACCESS_KEY_ID: dev-key-dev-key-dev-key-dev-key-dev
+      AWS_SECRET_ACCESS_KEY: dev-secret-dev-secret-dev-secret-dev-secr
 volumes:
   s3data: {}
 ```
+
+Recognized container env vars: `S3LITE_DATA_DIR` (default `/data`),
+`S3LITE_LISTEN_ADDR` (default `0.0.0.0:9000`), `S3LITE_REGION` (default
+`us-east-1`), `S3LITE_ACCESS_KEY_ID` + `S3LITE_SECRET_ACCESS_KEY` (both or
+neither), `S3LITE_ENDPOINT_HOST`, `S3LITE_TLS_CERT_PATH` +
+`S3LITE_TLS_KEY_PATH` (both or neither).
+
+The container runs as UID 65532. If you bind-mount a host directory at
+`/data`, make sure it's owned by that UID:
+`chown 65532:65532 ./data && chmod 700 ./data`. Docker-managed named
+volumes (as shown above) handle this automatically.
 
 ### Smoke test with aws-cli
 
