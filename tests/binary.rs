@@ -383,3 +383,184 @@ fn backup_then_restore_via_cli_round_trips_metadata() {
             .unwrap();
     });
 }
+
+// ---------------- `s3lite auto` (container entrypoint) ----------------
+
+/// Spawn `s3lite auto` with a fresh env (only the vars in `env` are passed),
+/// piping both stdout and stderr so callers can capture the credentials
+/// banner from a no-env-keys boot.
+async fn spawn_auto(
+    env: &[(&str, &str)],
+    endpoint: &str,
+) -> (
+    Child,
+    BufReader<tokio::process::ChildStdout>,
+    BufReader<tokio::process::ChildStderr>,
+) {
+    let mut cmd = TokioCommand::new(s3lite_bin());
+    cmd.arg("auto")
+        .env_clear()
+        // PATH is needed for child to exec; without it, runtime / dynamic
+        // loader lookups would fail on some hosts.
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn s3lite auto");
+    let stdout = BufReader::new(child.stdout.take().expect("stdout piped"));
+    let stderr = BufReader::new(child.stderr.take().expect("stderr piped"));
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .unwrap();
+    let health = format!("{endpoint}/health");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("auto server did not become healthy in time");
+        }
+        if let Ok(resp) = client.get(&health).send().await
+            && resp.status() == 200
+        {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    (child, stdout, stderr)
+}
+
+/// Drain a few stdout lines so we can find the generated credentials banner
+/// without blocking forever. The credentials block is emitted before the
+/// server starts listening, so by the time `/health` answers it's already
+/// flushed.
+async fn read_stdout_until_credentials(
+    stdout: &mut BufReader<tokio::process::ChildStdout>,
+) -> (String, String) {
+    let mut ak = None;
+    let mut sk = None;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && (ak.is_none() || sk.is_none()) {
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_millis(200), stdout.read_line(&mut line)).await {
+            Ok(Ok(n)) if n > 0 => {
+                if let Some(rest) = line.trim().strip_prefix("access_key_id") {
+                    ak = Some(rest.trim_start_matches([' ', '=']).trim().to_string());
+                } else if let Some(rest) = line.trim().strip_prefix("secret_access_key") {
+                    sk = Some(rest.trim_start_matches([' ', '=']).trim().to_string());
+                }
+            }
+            _ => continue,
+        }
+    }
+    (
+        ak.expect("auto must print access_key_id"),
+        sk.expect("auto must print secret_access_key"),
+    )
+}
+
+#[tokio::test]
+async fn auto_uses_env_credentials_when_provided() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    let port = free_port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let listen = format!("127.0.0.1:{port}");
+    let ak = "AKIAAUTOWITHENV00001";
+    let sk = "envsecret-envsecret-envsecret-envsecret1";
+    let data_dir_str = data_dir.to_string_lossy().to_string();
+    let env: &[(&str, &str)] = &[
+        ("S3LITE_DATA_DIR", &data_dir_str),
+        ("S3LITE_LISTEN_ADDR", &listen),
+        ("S3LITE_ACCESS_KEY_ID", ak),
+        ("S3LITE_SECRET_ACCESS_KEY", sk),
+    ];
+    let (mut child, _stdout, _stderr) = spawn_auto(env, &endpoint).await;
+
+    // SDK call with the env-provided credentials works.
+    let client = sdk_client(&endpoint, ak, sk).await;
+    client
+        .create_bucket()
+        .bucket("envboot")
+        .send()
+        .await
+        .expect("create_bucket");
+
+    // config.toml was written with those credentials.
+    let cfg = std::fs::read_to_string(data_dir.join("config.toml")).unwrap();
+    assert!(cfg.contains(ak), "config.toml should contain env access key");
+    assert!(cfg.contains(sk), "config.toml should contain env secret");
+
+    send_signal(child.id().expect("pid"), "TERM");
+    tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("auto exits")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn auto_generates_credentials_when_env_unset() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    let port = free_port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let listen = format!("127.0.0.1:{port}");
+    let data_dir_str = data_dir.to_string_lossy().to_string();
+    let env: &[(&str, &str)] = &[
+        ("S3LITE_DATA_DIR", &data_dir_str),
+        ("S3LITE_LISTEN_ADDR", &listen),
+        // No S3LITE_ACCESS_KEY_ID / S3LITE_SECRET_ACCESS_KEY → auto-generate.
+    ];
+    let (mut child, mut stdout, _stderr) = spawn_auto(env, &endpoint).await;
+
+    let (ak, sk) = read_stdout_until_credentials(&mut stdout).await;
+    assert!(!ak.is_empty() && !sk.is_empty());
+
+    // The generated key actually works.
+    let client = sdk_client(&endpoint, &ak, &sk).await;
+    client
+        .create_bucket()
+        .bucket("autogen")
+        .send()
+        .await
+        .expect("create_bucket with auto-generated credentials");
+
+    send_signal(child.id().expect("pid"), "TERM");
+    tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("auto exits")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn auto_rejects_partial_credentials() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    let data_dir_str = data_dir.to_string_lossy().to_string();
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}");
+    let output = TokioCommand::new(s3lite_bin())
+        .arg("auto")
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("S3LITE_DATA_DIR", &data_dir_str)
+        .env("S3LITE_LISTEN_ADDR", &listen)
+        .env("S3LITE_ACCESS_KEY_ID", "AKIAONLYTHEKEYNOTSEC")
+        // intentionally missing S3LITE_SECRET_ACCESS_KEY
+        .output()
+        .await
+        .expect("spawn s3lite auto");
+    assert!(!output.status.success(), "auto must fail on partial creds");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("must both be set"),
+        "expected partial-creds error message, got: {combined}"
+    );
+}
