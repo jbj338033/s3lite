@@ -22,12 +22,13 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     let uri_path = parts.uri.path();
     let query = parts.uri.query().unwrap_or("");
 
-    let addressing = match extract(host_header, uri_path, &state.config) {
+    let config = state.config_snapshot();
+    let addressing = match extract(host_header, uri_path, &config) {
         Ok(a) => a,
         Err(e) => return decorate(e, request_id, uri_path).into_response(),
     };
 
-    let body_bytes = match axum::body::to_bytes(body, state.config.max_signed_body_bytes).await {
+    let body_bytes = match axum::body::to_bytes(body, config.max_signed_body_bytes).await {
         Ok(b) => b,
         Err(_) => {
             return decorate(

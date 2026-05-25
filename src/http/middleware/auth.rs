@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::Request as HttpRequest;
@@ -13,7 +14,7 @@ use chrono::Utc;
 use scratchstack_aws_signature::principal::Principal;
 use scratchstack_aws_signature::{
     GetSigningKeyRequest, GetSigningKeyResponse, KSecretKey, NO_ADDITIONAL_SIGNED_HEADERS,
-    SignatureOptions, sigv4_validate_request,
+    SignatureError, SignatureOptions, sigv4_validate_request,
 };
 use subtle::ConstantTimeEq;
 use tower::{BoxError, Service};
@@ -54,7 +55,14 @@ impl Service<GetSigningKeyRequest> for RootKeyService {
                 .as_bytes()
                 .ct_eq(expected_access_key.as_bytes());
             if !bool::from(matches) {
-                return Err::<GetSigningKeyResponse, BoxError>("unknown access key".into());
+                // Box the typed error so scratchstack's downcast can recover the
+                // variant and our middleware maps it to `InvalidAccessKeyId`
+                // instead of `SignatureDoesNotMatch`.
+                let err = SignatureError::InvalidClientTokenId(format!(
+                    "access key '{}' is not registered",
+                    req.access_key()
+                ));
+                return Err::<GetSigningKeyResponse, BoxError>(Box::new(err));
             }
             let k_secret = KSecretKey::from_str(&expected_secret)?;
             let k_signing = k_secret.to_ksigning(req.request_date(), req.region(), req.service());
@@ -75,10 +83,14 @@ impl Service<GetSigningKeyRequest> for RootKeyService {
 /// reconstruction. Streaming-signed / unsigned-payload optimization lands
 /// in Phase 6+.
 pub async fn sigv4_mw(
-    State(config): State<Arc<ServerConfig>>,
+    State(config_swap): State<Arc<ArcSwap<ServerConfig>>>,
     mut req: Request,
     next: Next,
 ) -> Result<Response, S3Error> {
+    // Snapshot the live config once per request — a concurrent SIGHUP reload
+    // publishes a new `Arc`, but this request runs to completion on the
+    // snapshot it saw at entry (so credentials don't change mid-verification).
+    let config = config_swap.load_full();
     // CORS preflight requests carry no Sigv4 signature by design — let them
     // through unauthenticated. The CORS handler in s3::cors decides whether
     // to accept based on the bucket's configured rules.
@@ -151,10 +163,8 @@ pub async fn sigv4_mw(
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(error = %e, "sigv4 verification failed");
-            return Err(attach_id(S3Error::new(
-                S3ErrorCode::SignatureDoesNotMatch,
-                format!("signature verification failed: {e}"),
-            )));
+            let s3_err = map_sigv4_error(e);
+            return Err(attach_id(s3_err));
         }
     };
 
@@ -164,4 +174,38 @@ pub async fn sigv4_mw(
     });
 
     Ok(next.run(authed).await)
+}
+
+/// Translate scratchstack's `SignatureError` (delivered as a `BoxError`) into
+/// the closest matching S3 error code. Signature-expired / clock-skew messages
+/// arrive inside `SignatureDoesNotMatch`, so they need substring sniffing;
+/// every other variant maps 1:1.
+fn map_sigv4_error(err: BoxError) -> S3Error {
+    let sig: SignatureError = err.into();
+    let msg = sig.to_string();
+    let code = match &sig {
+        SignatureError::InvalidClientTokenId(_) => S3ErrorCode::InvalidAccessKeyId,
+        SignatureError::MissingAuthenticationToken(_) => S3ErrorCode::MissingSecurityHeader,
+        SignatureError::IncompleteSignature(_) => S3ErrorCode::AuthorizationHeaderMalformed,
+        SignatureError::MalformedQueryString(_) => S3ErrorCode::AuthorizationHeaderMalformed,
+        SignatureError::InvalidURIPath(_) => S3ErrorCode::InvalidRequest,
+        SignatureError::InvalidBodyEncoding(_) => S3ErrorCode::InvalidRequest,
+        SignatureError::InvalidContentType(_) => S3ErrorCode::InvalidRequest,
+        SignatureError::InvalidRequestMethod(_) => S3ErrorCode::InvalidRequest,
+        SignatureError::ExpiredToken(_) => S3ErrorCode::RequestTimeTooSkewed,
+        SignatureError::SignatureDoesNotMatch(_)
+            if msg.contains("Signature expired") || msg.contains("Signature not yet current") =>
+        {
+            S3ErrorCode::RequestTimeTooSkewed
+        }
+        SignatureError::SignatureDoesNotMatch(_) => S3ErrorCode::SignatureDoesNotMatch,
+        SignatureError::IO(_) | SignatureError::InternalServiceError(_) => {
+            S3ErrorCode::InternalError
+        }
+        // `SignatureError` is `#[non_exhaustive]`: future variants surface as
+        // SignatureDoesNotMatch so existing clients keep getting an opaque
+        // signature error rather than a 500.
+        _ => S3ErrorCode::SignatureDoesNotMatch,
+    };
+    S3Error::new(code, msg)
 }

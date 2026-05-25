@@ -71,7 +71,7 @@ pub async fn create_bucket(
     let cfg = BucketConfig {
         created_at: OffsetDateTime::now_utc(),
         versioning,
-        region: state.config.region.clone(),
+        region: state.config_snapshot().region.clone(),
         cors_rules: Vec::new(),
         object_lock,
         lifecycle_rules: Vec::new(),

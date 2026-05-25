@@ -91,7 +91,13 @@ async fn unsigned_s3_request_returns_403_with_xml_body() {
 
     let body_bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
     let body = std::str::from_utf8(&body_bytes).unwrap();
-    assert!(body.contains("<Code>SignatureDoesNotMatch</Code>"), "body: {body}");
+    // Unsigned requests now surface as `MissingSecurityHeader` instead of a
+    // generic `SignatureDoesNotMatch` — the sigv4 error mapper distinguishes
+    // "no auth was attempted" from "auth was attempted but wrong".
+    assert!(
+        body.contains("<Code>MissingSecurityHeader</Code>"),
+        "body: {body}"
+    );
     assert!(body.contains("<Resource>"), "body missing Resource: {body}");
     assert!(body.contains("<RequestId>"), "body missing RequestId: {body}");
 }

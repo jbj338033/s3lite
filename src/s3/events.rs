@@ -29,8 +29,8 @@ pub struct ObjectEvent {
 /// delivery task for each. Returns immediately so the request handler can
 /// reply without waiting on the webhook RTT.
 pub fn emit(state: &AppState, event: ObjectEvent) {
-    let subs: Vec<WebhookSubscription> = state
-        .config
+    let config = state.config_snapshot();
+    let subs: Vec<WebhookSubscription> = config
         .webhook_subscriptions
         .iter()
         .filter(|s| matches_subscription(s, &event))
@@ -39,14 +39,14 @@ pub fn emit(state: &AppState, event: ObjectEvent) {
     if subs.is_empty() {
         return;
     }
-    let payload = match build_payload(state, &event) {
+    let payload = match build_payload(&config, event.clone()) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "failed to build event payload");
             return;
         }
     };
-    let allow_loopback = state.config.allow_loopback_webhooks;
+    let allow_loopback = config.allow_loopback_webhooks;
     let meta = state.meta.clone();
     for sub in subs {
         let payload = payload.clone();
@@ -123,12 +123,15 @@ struct EventObject {
     sequencer: String,
 }
 
-fn build_payload(state: &AppState, event: &ObjectEvent) -> Result<String, serde_json::Error> {
+fn build_payload(
+    config: &crate::config::ServerConfig,
+    event: ObjectEvent,
+) -> Result<String, serde_json::Error> {
     let payload = EventPayload {
         records: vec![EventRecord {
             event_version: "2.1",
             event_source: "s3lite",
-            aws_region: state.config.region.clone(),
+            aws_region: config.region.clone(),
             event_time: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
                 .unwrap_or_default(),
@@ -136,14 +139,14 @@ fn build_payload(state: &AppState, event: &ObjectEvent) -> Result<String, serde_
             s3: EventS3 {
                 schema_version: "1.0",
                 bucket: EventBucket {
-                    name: event.bucket.clone(),
                     arn: format!("arn:s3lite:::{}", event.bucket),
+                    name: event.bucket,
                 },
                 object: EventObject {
-                    key: event.key.clone(),
+                    key: event.key,
                     size: event.size,
-                    etag: event.etag.clone(),
-                    version_id: event.version_id.clone(),
+                    etag: event.etag,
+                    version_id: event.version_id,
                     // Sequencer is meant to be a monotonically-increasing token
                     // letting consumers order events for the same key. A uuid
                     // simple id is unique-enough and stable-shaped for clients
